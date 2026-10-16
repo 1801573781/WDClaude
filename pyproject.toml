@@ -1,0 +1,38 @@
+[project]
+name = "wdclaude"
+version = "0.2.0"
+description = "WDClaude Code - 终端 AI 编程助手（Claude Code 复刻）"
+requires-python = ">=3.10"
+
+# 核心依赖：安装 wdclaude 时自动安装（设计文档 5.3 第 1 层保障）
+dependencies = [
+    "openai>=1.0",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+]
+
+# 可选依赖组：按需安装，安装后 wdclaude doctor 会检测提示
+[project.optional-dependencies]
+memory  = ["numpy", "faiss-cpu", "openpyxl"]      # 向量记忆 + Excel 报表
+search  = ["requests", "httpx"]                    # 联网搜索
+test    = ["pytest", "fastapi", "uvicorn", "httpx", "openpyxl"]  # A2A 测试链（v2.0 转正）
+all     = ["wdclaude[memory,search,test]"]
+
+[project.scripts]
+wdclaude = "wdclaude.__main__:main"     # ← 直接命令启动（设计文档第 6 章）
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]                       # 源码布局：src/wdclaude/...
+include = ["wdclaude*"]               # 只收 wdclaude 包，天然排除 dev_only/A2A 等开发设施
+
+[tool.setuptools.package-data]
+wdclaude = [
+    "defaults/**/*.yaml",
+    "defaults/**/*.tpl",
+    "defaults/roles/**/*.md",
+    "skills/**/SKILL.md",
+]

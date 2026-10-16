@@ -1,37 +1,64 @@
 # WDClaude
 
-#### 介绍
-为了学习Claude Code，构建了MyClaude。现在需要将MyClaude做一个重构，担心干崩了，重新做一个，取名WDClaude。首先将MyClaude个搬迁过来，然后重构WDClaude。
+Claude Code 的 Python 复刻——基于 LLM 的终端 AI 编程助手（由 MyClaude 重构而来）。
 
-#### 软件架构
-软件架构说明
+## 特性
 
+- **XML 工具协议**：LLM 通过 `file_view / create / str_replace / bash / web_search / use_skill` 等标签驱动工具执行，多轮循环直至任务完成
+- **启动即项目**：在哪里启动，哪里就是项目目录（B）；全部运行数据收纳于 `B/.wdclaude/`，不污染项目根
+- **记忆系统**（memory_ex）：会话记忆提取 / 向量召回（FAISS）/ LLM 精排 / Bug 库
+- **A2A 测试链**：单元/系统测试用例生成→沙箱执行→LLM 评判→Excel 报告（`/test` 系列命令）
+- **双级配置**：包内出厂默认 + 项目级 `.wdclaude/config/` + 环境变量，密钥三级查找
 
-#### 安装教程
+## 快速开始
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+```bash
+# 开发态（仓库内）
+start.bat                        # 或 set PYTHONPATH=src && python -m wdclaude
 
-#### 使用说明
+# 安装态（任意目录）
+pip install wdclaude-0.2.0-py3-none-any.whl
+wdclaude                          # 交互模式
+```
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+首次在项目目录启动会自动初始化 `.wdclaude/` 全套骨架，并引导填写 API Key。
 
-#### 参与贡献
+## 常用命令
 
-1.  Fork 本仓库
-2.  新建 Feat_xxx 分支
-3.  提交代码
-4.  新建 Pull Request
+| 命令 | 用途 |
+|------|------|
+| `wdclaude` | 交互模式 |
+| `wdclaude --version` | 版本 |
+| `wdclaude doctor` | 环境体检 |
+| `wdclaude --test-mode --prompt "..."` | 测试模式（结构化 JSON 输出） |
+| `/test --ut-c / --st-c ...`（CLI 内） | A2A 测试链 |
 
+## 可选依赖
 
-#### 特技
+```bash
+pip install wdclaude[memory]   # numpy / faiss-cpu / openpyxl（向量记忆 + Excel 报表）
+pip install wdclaude[search]   # requests / httpx（联网搜索）
+pip install wdclaude[test]     # fastapi / uvicorn / pytest（A2A 测试链）
+```
 
-1.  使用 Readme\_XXX.md 来支持不同的语言，例如 Readme\_en.md, Readme\_zh.md
-2.  Gitee 官方博客 [blog.gitee.com](https://blog.gitee.com)
-3.  你可以 [https://gitee.com/explore](https://gitee.com/explore) 这个地址来了解 Gitee 上的优秀开源项目
-4.  [GVP](https://gitee.com/gvp) 全称是 Gitee 最有价值开源项目，是综合评定出的优秀开源项目
-5.  Gitee 官方提供的使用手册 [https://gitee.com/help](https://gitee.com/help)
-6.  Gitee 封面人物是一档用来展示 Gitee 会员风采的栏目 [https://gitee.com/gitee-stars/](https://gitee.com/gitee-stars/)
+## 目录模型（v2.0）
+
+```
+<你的项目目录>/            # = 启动目录 B
+├── .wdclaude/             # wdclaude 全部运行数据
+│   ├── config/            #   config.yaml、model_key.yaml（密钥，不入 git）
+│   ├── tmp_output/        #   AI 临时代码输出（探索/测试/草稿）
+│   ├── log/sessions/      #   运行日志 + 会话日志
+│   ├── memory_storage/    #   记忆 / Bug 库
+│   ├── skills/            #   项目技能
+│   └── commands/          #   斜杠命令
+└── spec/                  # 需求规格（项目资产）
+```
+
+## 安全提示
+
+克隆他人项目时请注意：其 `.wdclaude/commands/`、`.wdclaude/skills/` 中可能包含指令模板，属于信任边界问题，请自行审查后再使用。
+
+## License
+
+见 [LICENSE](LICENSE)。

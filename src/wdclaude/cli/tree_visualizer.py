@@ -1,0 +1,1489 @@
+#!/usr/bin/env python3
+"""
+WDClaude 目录地图可视化生成器
+递归扫描项目目录，调用 LLM 生成文件概述，输出标准树形目录。
+LLM 经 chat_llm.simple_chat 统一调用，模型由 .wdclaude/config/model_key.yaml 的
+simple_chat.provider 配置（缺失时自动回退主模型）。
+通过 CLI 命令 /init 调用 create_project_tree()。
+输出产物（.tree_cache.md 等）存放于 B/.wdclaude/init/转义 project_root/ 目录之下。
+"""
+
+import ast
+import fnmatch
+import json
+import os
+import re
+import shutil
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from rich.console import Console
+from rich.tree import Tree
+from datetime import datetime
+
+from wdclaude.utility.config_loader import global_cfg
+from wdclaude.paths import paths as _paths
+from wdclaude.cli.cli_print import console
+from wdclaude.query.chat_llm import simple_chat
+
+summary_len = 50
+
+
+# ============================================================
+# .gitignore 解析
+# ============================================================
+
+def parse_gitignore(dir_path: Path, scope: str = "") -> list[dict]:
+    """
+    解析指定目录下的 .gitignore 文件，返回规则列表。
+    每条规则为 dict：{"pattern": str, "is_negate": bool, "is_dir_only": bool, "scope": str}
+    scope 为该 .gitignore 所在目录相对项目根的路径（"" 表示项目根目录），
+    嵌套 .gitignore 的规则仅在其所属目录子树内生效。
+    """
+    gitignore_path = dir_path / ".gitignore"
+    if not gitignore_path.is_file():
+        return []
+
+    rules = []
+    try:
+        content = gitignore_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+
+    for line in content.splitlines():
+        line = line.strip()
+        # 跳过空行和注释
+        if not line or line.startswith("#"):
+            continue
+
+        is_negate = False
+        if line.startswith("!"):
+            is_negate = True
+            line = line[1:].strip()
+
+        if not line:
+            continue
+
+        is_dir_only = line.endswith("/")
+        if is_dir_only:
+            line = line[:-1]
+
+        rules.append({
+            "pattern": line,
+            "is_negate": is_negate,
+            "is_dir_only": is_dir_only,
+            "scope": scope,
+        })
+
+    return rules
+
+
+def is_ignored_by_gitignore(
+        rel_path: str,
+        is_dir: bool,
+        rules: list[dict],
+) -> bool:
+    """
+    判断相对路径是否被 .gitignore 规则忽略（支持嵌套 .gitignore 的作用域匹配）。
+    每条规则仅在自身 scope（所属 .gitignore 所在目录）子树内生效。
+    按规则顺序匹配，最后匹配的规则决定结果。
+    """
+    ignored = False
+    for rule in rules:
+        # 作用域检查：嵌套 .gitignore 的规则仅在其所属目录子树内生效
+        scope = rule.get("scope", "")
+        if scope:
+            if rel_path == scope:
+                continue  # 规则不作用于其所属目录本身
+            if not rel_path.startswith(scope + "/"):
+                continue  # 路径不在规则作用域内
+            sub_path = rel_path[len(scope) + 1:]
+        else:
+            sub_path = rel_path
+
+        pattern = rule["pattern"]
+        is_negate = rule["is_negate"]
+        is_dir_only = rule["is_dir_only"]
+
+        # 如果规则仅匹配目录，但当前不是目录，跳过
+        if is_dir_only and not is_dir:
+            continue
+
+        # 匹配逻辑（在规则作用域内以子路径匹配）
+        matched = False
+        # 尝试匹配完整相对路径（目录入参带尾斜杠，需同时尝试去斜杠形式，
+        # 否则 ".wdclaude/log/" 这类含斜杠且无通配符的目录规则永远无法命中）
+        path_variants = (sub_path, sub_path.rstrip("/"), os.path.basename(sub_path))
+        if any(_match_pattern(p, pattern) for p in path_variants):
+            matched = True
+        # 对于目录，也尝试匹配目录名
+        if is_dir and not matched:
+            dir_name = os.path.basename(sub_path.rstrip("/").rstrip("\\"))
+            if _match_pattern(dir_name, pattern):
+                matched = True
+            # 也匹配带斜杠的目录名
+            if _match_pattern(dir_name + "/", pattern):
+                matched = True
+
+        if matched:
+            ignored = not is_negate
+
+    return ignored
+
+
+def _match_pattern(path: str, pattern: str) -> bool:
+    """使用 fnmatch 进行 glob 模式匹配。"""
+    # 处理 ** 模式
+    if "**" in pattern:
+        return _match_globstar(path, pattern)
+    return fnmatch.fnmatch(path, pattern)
+
+
+def _match_globstar(path: str, pattern: str) -> bool:
+    """支持 ** 的简单 glob 匹配。"""
+    # 使用更简单的方法：将 ** 替换为占位符，构建正则
+    temp_pattern = pattern
+    # 先保护 **
+    temp_pattern = temp_pattern.replace("**", "\x00GLOBSTAR\x00")
+    # 转义
+    regex_str = re.escape(temp_pattern)
+    # 还原 ** 为 .*
+    regex_str = regex_str.replace("\x00GLOBSTAR\x00", ".*")
+    # 还原 * 为 [^/]*
+    regex_str = regex_str.replace(r"\*", "[^/]*")
+    # 处理 ? 通配符
+    regex_str = regex_str.replace(r"\?", "[^/]")
+
+    try:
+        return bool(re.match("^" + regex_str + "$", path))
+    except re.error:
+        return fnmatch.fnmatch(path, pattern)
+
+
+def collect_all_gitignore_rules(root_path: Path) -> list[dict]:
+    """
+    递归收集项目中所有 .gitignore 规则（含嵌套子项目，如 wdbuddy）。
+    返回带 scope 的规则列表，嵌套规则仅在其所属目录子树内生效。
+    遍历时跳过依赖/缓存/隐藏目录，避免解析海量无关 .gitignore。
+    """
+    # 项目根目录规则（scope=""，作用于全项目）
+    all_rules: list[dict] = parse_gitignore(root_path)
+
+    # 递归查找嵌套 .gitignore（子项目自身的忽略规则）
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        # 原地剪枝：不进入依赖、缓存、隐藏目录
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in SKIP_DIR_NAMES
+            and d != "__pycache__"
+            and d not in VCS_DIR_NAMES
+        ]
+        if ".gitignore" not in filenames:
+            continue
+        dir_path = Path(dirpath)
+        if dir_path == root_path:
+            continue  # 根目录已处理
+        try:
+            scope = str(dir_path.relative_to(root_path)).replace("\\", "/")
+        except ValueError:
+            continue
+        all_rules.extend(parse_gitignore(dir_path, scope))
+
+    return all_rules
+
+
+# ============================================================
+# 二进制扩展名排除
+# ============================================================
+
+BINARY_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico",
+    ".mp4", ".avi", ".mov", ".mp3", ".wav",
+    ".zip", ".tar", ".gz", ".rar", ".7z",
+    ".exe", ".dll", ".so", ".dylib",
+    ".bin", ".dat", ".db", ".sqlite", ".sqlite3",
+    ".pyc", ".pyo", ".class", ".o", ".a",
+}
+
+
+def is_binary_extension(file_path: Path) -> bool:
+    """检查文件扩展名是否在二进制排除列表中（大小写不敏感）。"""
+    return file_path.suffix.lower() in BINARY_EXTENSIONS
+
+
+# ============================================================
+# 函数级摘要数据结构
+# ============================================================
+
+@dataclass
+class FuncInfo:
+    """函数信息"""
+    name: str           # 函数/方法名
+    start_line: int     # 起始行号
+    end_line: int       # 结束行号
+    docstring: str = "" # docstring（如有）
+    summary: str = ""   # LLM 生成的概述（初始为空，后填充）
+
+
+@dataclass
+class ClassInfo:
+    """类信息"""
+    name: str           # 类名
+    start_line: int     # 起始行号
+    end_line: int       # 结束行号
+    docstring: str = "" # docstring（如有）
+    summary: str = ""   # LLM 生成的概述
+    methods: list = field(default_factory=list)  # List[FuncInfo]，类内方法
+
+
+@dataclass
+class FileInfo:
+    """文件信息"""
+    file_path: str      # 相对路径
+    file_summary: str = ""   # 文件级概述（在本次执行中由 LLM 生成，与 /init 一致）
+    functions: list = field(default_factory=list)  # List[FuncInfo]，模块级函数
+    classes: list = field(default_factory=list)    # List[ClassInfo]，类定义
+    source_code: str = ""  # 完整源代码，传给 LLM 做函数级摘要
+
+
+# ============================================================
+# 缓存机制
+# ============================================================
+
+def load_cache(cache_path: Path) -> dict[str, tuple[int, str]]:
+    """
+    从缓存表格文件加载缓存。
+    返回 dict：key = 文件绝对路径，value = (mtime, overview)
+    """
+    cache: dict[str, tuple[int, str]] = {}
+    if not cache_path.is_file():
+        return cache
+
+    try:
+        content = cache_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return cache
+
+    lines = content.splitlines()
+    in_table = False
+    for line in lines:
+        line = line.strip()
+        # 跳过标题和非表格行
+        if line.startswith("#"):
+            continue
+        if line.startswith("|") and "文件路径" in line:
+            in_table = True
+            continue
+        if line.startswith("|---"):
+            continue
+        if not in_table:
+            continue
+        if not line.startswith("|"):
+            continue
+
+        # 解析表格行：| 文件路径 | 修改时间 | 概述 |
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 4:  # 含首尾空元素
+            file_path = parts[1]
+            try:
+                mtime = int(datetime.strptime(parts[2], "%Y-%m-%d %H:%M:%S").timestamp())
+            except (ValueError, IndexError):
+                continue
+            overview = parts[3] if len(parts) > 3 else ""
+            cache[file_path] = (mtime, overview)
+
+    return cache
+
+
+def save_cache(cache_path: Path, cache: dict[str, tuple[int, str]], root_path: Path) -> None:
+    """保存缓存表格到独立文件（不影响树形结构文件）。"""
+    lines = [
+        f"# 项目文件概述，目录地图 for {root_path}\n",
+        "| 文件路径 | 修改时间 | 概述 |",
+        "|---------|---------|------|",
+    ]
+    for file_path, (mtime, overview) in sorted(cache.items()):
+        dt_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+        lines.append(f"| {file_path} | {dt_str} | {overview} |")
+    try:
+        cache_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        pass  # 缓存写入失败不阻塞主流程
+
+
+# ============================================================
+# LLM 概述生成
+# ============================================================
+
+MAX_FILE_SIZE = 50 * 1024  # 50KB
+
+PROMPT_TEMPLATE = """\
+请为文件 "{file_name}" 生成一句不超过{summary_len}字的"核心功能总结"。
+文件内容片段：
+{content_snippet}
+规则：
+1. 必须输出总结，不能为空。
+2. 总结应直接描述该文件在整个项目中的作用（例如"实现斐波那契数列计算"）。
+3. 禁止使用"文件用于"、"此文件"、"本文件"等废话，直接说功能。
+4. 如果文件内容极少或全是注释，输出"辅助模块"或"配置文件"。
+5. 输出总结可以使用自然标点（句号/逗号等），但不要添加无关的解释或引号。
+只输出总结文本。"""
+
+
+def get_file_overview(
+        file_path: Path,
+        cache: dict[str, tuple[int, str]],
+        root_path: Path,
+        record: dict[str, float] | None = None,
+        stats: dict | None = None,
+) -> str:
+    """
+    获取文件概述。优先使用缓存，缓存未命中则调用 LLM。
+    返回概述文本。每次获取概述后打印到 CLI 终端（原 save_cache 逻辑改为打印）。
+    增量检查：缓存 mtime 匹配 + .init_record.json 中 mtime 匹配 → 跳过。
+    """
+    abs_path = str(file_path.resolve())
+    mtime = int(file_path.stat().st_mtime)
+
+    if stats is not None:
+        stats["total_files"] = stats.get("total_files", 0) + 1
+        stats.setdefault("visited", set()).add(abs_path)
+
+    # 检查缓存 + 增量记录
+    if abs_path in cache:
+        cached_mtime, cached_overview = cache[abs_path]
+        if cached_mtime == mtime:
+            # 检查 .init_record.json 记录
+            try:
+                rel_path = str(file_path.relative_to(root_path)).replace("\\", "/")
+            except ValueError:
+                rel_path = file_path.name
+            if record is None or (rel_path in record and mtime <= int(record[rel_path])):
+                # 命中缓存，打印到终端
+                console.print(f"  [dim]📄 {file_path.name} → {cached_overview} [缓存][/dim]")
+                if stats is not None:
+                    stats["reused"] = stats.get("reused", 0) + 1
+                return cached_overview
+
+    # 读取文件内容
+    file_size = file_path.stat().st_size
+    is_truncated = file_size > MAX_FILE_SIZE
+    try:
+        if is_truncated:
+            with open(file_path, "rb") as f:
+                raw = f.read(MAX_FILE_SIZE)
+            try:
+                content = raw.decode("utf-8", errors="replace")
+            except UnicodeDecodeError:
+                content = raw.decode("latin-1", errors="replace")
+        else:
+            content = file_path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, UnicodeDecodeError, PermissionError):
+        overview = "(无法读取)"
+        cache[abs_path] = (mtime, overview)
+        console.print(f"  [red]📄 {file_path.name} → {overview}[/red]")
+        return overview
+
+    # 调用 LLM 生成概述：统一走 chat_llm.simple_chat，
+    # 模型由 model_key.yaml 的 simple_chat.provider 配置（缺失时自动回退主模型）
+    prompt = PROMPT_TEMPLATE.format(
+        file_name=file_path.name,
+        summary_len=summary_len,
+        content_snippet=content[:16000]
+    )
+    overview = simple_chat(
+        prompt,
+        temperature=0.3,
+        max_tokens=global_cfg.model_chat.initial_max_tokens,
+        query="/init",
+        turn="TREE_FILE_SUMMARY",
+        timeout=180,
+    )
+    if overview:
+        overview = overview.strip('"\'').strip()
+    else:
+        overview = "(API错误: LLM 调用失败，详见日志)"
+
+    if is_truncated:
+        overview += " (截断)"
+
+    # 更新缓存
+    cache[abs_path] = (mtime, overview)
+    # 原来 save_cache 在这里，现在改为打印到终端
+    console.print(f"  [green]📄 {file_path.name} → {overview}[/green]")
+
+    if stats is not None:
+        stats["generated"] = stats.get("generated", 0) + 1
+
+    return overview
+
+
+# ============================================================
+# 树形构建与输出
+# ============================================================
+
+def build_tree(
+        root_path: Path,
+        current_path: Path,
+        gitignore_rules: list[dict],
+        cache: dict[str, tuple[int, str]],
+        record: dict[str, float] | None = None,
+        stats: dict | None = None,
+) -> Tree | None:
+    """
+    递归构建 rich Tree 结构。
+    返回 Tree 节点，如果当前目录为空（所有内容被忽略）则返回 None。
+    """
+    # 计算相对路径用于 gitignore 匹配
+    try:
+        rel_path = str(current_path.relative_to(root_path))
+        if rel_path == ".":
+            rel_path = ""
+    except ValueError:
+        rel_path = str(current_path)
+
+    dir_name = current_path.name or str(current_path)
+    tree = Tree(f"{dir_name}/")
+
+    # 收集子条目
+    try:
+        entries = sorted(
+            current_path.iterdir(),
+            key=lambda p: (not p.is_dir(), p.name.lower()),
+        )
+    except (PermissionError, OSError):
+        return tree  # 无法访问的目录返回空节点
+
+    has_visible_children = False
+
+    for entry in entries:
+        entry_name = entry.name
+
+        # 跳过版本控制元数据目录（.git/.svn/.hg 不受 gitignore 管辖，需显式排除）
+        if entry.is_dir() and entry_name in VCS_DIR_NAMES:
+            continue
+
+        # 跳过 .gitkeep 占位文件（仅用于 git 保留空目录，无内容价值）
+        if entry_name == '.gitkeep':
+            continue
+
+        # 跳过 .docx 文件
+        if entry_name.endswith('.docx'):
+            continue
+
+        # 跳过 __init__.py 文件
+        if entry_name == '__init__.py':
+            continue
+
+        # 兜底黑名单：依赖目录、锁文件、日志文件（.gitignore 缺失时也强制跳过）
+        if is_always_skipped(entry, entry.is_dir()):
+            continue
+
+        # 计算条目的相对路径
+        if rel_path:
+            entry_rel = f"{rel_path}/{entry_name}"
+        else:
+            entry_rel = entry_name
+
+        if entry.is_dir():
+            entry_rel_dir = entry_rel + "/"
+            # 检查是否被 gitignore 忽略
+            if is_ignored_by_gitignore(entry_rel_dir, True, gitignore_rules):
+                continue
+            # 递归构建子树
+            sub_tree = build_tree(
+                root_path, entry, gitignore_rules, cache,
+                record=record, stats=stats,
+            )
+            if sub_tree is not None:
+                tree.add(sub_tree)
+                has_visible_children = True
+        else:
+            # 文件
+            # 检查二进制扩展名
+            if is_binary_extension(entry):
+                continue
+            # 检查 gitignore
+            if is_ignored_by_gitignore(entry_rel, False, gitignore_rules):
+                continue
+
+            # 获取概述
+            overview = get_file_overview(entry, cache, root_path,
+                                         record=record, stats=stats)
+
+            # 格式化 label：文件名 + 填充空格 + # 概述
+            label = _format_label(entry_name, overview)
+            tree.add(label)
+            has_visible_children = True
+
+    # 如果没有任何可见子节点（且不是根目录），返回 None
+    if not has_visible_children and rel_path != "":
+        return None
+
+    return tree
+
+
+def _format_label(file_name: str, overview: str) -> str:
+    """格式化树节点标签，使概述对齐。"""
+    target_col = 45
+    current_len = len(file_name)
+    padding = max(2, target_col - current_len)
+    return f"{file_name}{' ' * padding}# {overview}"
+
+
+# ============================================================
+# 保存树形结构到文件
+# ============================================================
+
+def _save_tree_to_file(tree: Tree, cache_path: Path, root_path: Path) -> None:
+    """
+    将 rich Tree 渲染为纯文本并保存到 .tree_cache.md。
+    原来 console.print(tree) 的打印逻辑改为 save 到文件。
+    """
+    from io import StringIO
+
+    # 使用临时 Console 捕获 rich Tree 的文本输出
+    capture_console = Console(file=StringIO(), force_terminal=True, width=120)
+    capture_console.print(tree)
+    tree_text = capture_console.file.getvalue()
+
+    lines = [
+        f"# 项目目录树 for {root_path}\n",
+        f"# 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
+        "",
+        "```",
+        tree_text.strip(),
+        "```",
+    ]
+    try:
+        cache_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        pass  # 写入失败不阻塞主流程
+
+
+# ============================================================
+# AST 解析与函数级摘要
+# ============================================================
+
+def extract_ast_info(file_path: str) -> FileInfo | None:
+    """
+    使用 ast 模块解析 Python 文件，提取函数/类/方法的名称与行范围。
+    不依赖 LLM，纯静态分析。
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            source = f.read()
+    except (OSError, PermissionError):
+        return None
+
+    if not source.strip():
+        return None
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+
+    # FileInfo 的 file_path 存储相对路径，由调用者设置
+    file_info = FileInfo(file_path="")
+    file_info.source_code = source
+
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func = FuncInfo(
+                name=node.name,
+                start_line=node.lineno,
+                end_line=node.end_lineno if hasattr(node, "end_lineno") and node.end_lineno else node.lineno,
+                # noinspection PyTypeChecker
+                docstring=ast.get_docstring(node) or "",
+                summary="",
+            )
+            file_info.functions.append(func)
+        elif isinstance(node, ast.ClassDef):
+            class_info = ClassInfo(
+                name=node.name,
+                start_line=node.lineno,
+                end_line=node.end_lineno if hasattr(node, "end_lineno") and node.end_lineno else node.lineno,
+                # noinspection PyTypeChecker
+                docstring=ast.get_docstring(node) or "",
+                summary="",
+                methods=[],
+            )
+            # 遍历类内方法
+            # noinspection PyTypeChecker
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    method = FuncInfo(
+                        name=child.name,
+                        start_line=child.lineno,
+                        end_line=child.end_lineno if hasattr(child, "end_lineno") and child.end_lineno else child.lineno,
+                        # noinspection PyTypeChecker
+                        docstring=ast.get_docstring(child) or "",
+                        summary="",
+                    )
+                    class_info.methods.append(method)
+            file_info.classes.append(class_info)
+
+    return file_info
+
+
+FUNC_SUMMARY_PROMPT_TEMPLATE = """\
+请为以下 Python 文件中的函数/方法/类生成概述，每个不超过30字。
+直接描述其功能，禁止使用"此函数"、"该方法"等废话。
+
+文件：{file_path}
+
+以下是 AST 提取的函数/类列表（含行范围，供你定位参考）：
+{func_list}
+
+以下是该文件的完整源代码：
+```python
+{source_code}
+```
+
+请返回 JSON 数组，每个元素格式为：{{"name": "函数名", "summary": "概述"}}
+注意：只返回 JSON，不要添加 markdown 代码块标记或其他文字。"""
+
+
+def batch_generate_summaries(file_info: FileInfo) -> None:
+    """
+    批量调用 LLM 为函数/类生成概述。
+    策略：将单个文件的所有函数签名 + docstring 打包为一次 LLM 请求，
+    要求 LLM 返回 JSON 数组，每个元素含 name + summary。
+    """
+
+    # 构造函数列表文本
+    func_items: list[str] = []
+    all_names: list[str] = []
+
+    for func in file_info.functions:
+        func_items.append(
+            f"- {func.name} (L{func.start_line}-L{func.end_line})\n  docstring: {func.docstring or '无'}"
+        )
+        all_names.append(func.name)
+
+    for cls in file_info.classes:
+        func_items.append(
+            f"- class {cls.name} (L{cls.start_line}-L{cls.end_line})\n  docstring: {cls.docstring or '无'}"
+        )
+        all_names.append(cls.name)
+        for method in cls.methods:
+            func_items.append(
+                f"  - {cls.name}.{method.name} (L{method.start_line}-L{method.end_line})\n    docstring: {method.docstring or '无'}"
+            )
+            all_names.append(method.name)
+
+    if not func_items:
+        return
+
+    func_list_text = "\n".join(func_items)
+    prompt = FUNC_SUMMARY_PROMPT_TEMPLATE.format(
+        file_path=file_info.file_path,
+        func_list=func_list_text,
+        source_code=file_info.source_code,
+    )
+
+    try:
+        raw_content = simple_chat(
+            prompt,
+            temperature=0.3,
+            max_tokens=global_cfg.model_chat.initial_max_tokens,
+            query="/init",
+            turn="TREE_FUNC_SUMMARY",
+            timeout=300,
+        ).strip()
+
+        # 去除可能的 markdown 代码块标记
+        if raw_content.startswith("```"):
+            raw_content = re.sub(r"^```(?:json)?\s*\n?", "", raw_content)
+            raw_content = re.sub(r"\n?```\s*$", "", raw_content)
+
+        summaries = json.loads(raw_content)
+
+        # 构建 name -> summary 映射
+        name_to_summary: dict[str, str] = {}
+        for item in summaries:
+            if isinstance(item, dict) and "name" in item and "summary" in item:
+                name_to_summary[item["name"]] = item["summary"]
+
+        # 回填概述
+        _fill_summaries(file_info, name_to_summary)
+
+        # 检查是否有未匹配的，降级为逐函数请求
+        missing_names = [n for n in all_names if n not in name_to_summary]
+        if missing_names:
+            _fallback_individual_summaries(file_info, missing_names)
+
+    except (json.JSONDecodeError, Exception):
+        # LLM 返回格式异常，降级为逐函数请求
+        _fallback_individual_summaries(file_info, all_names)
+
+
+def _fill_summaries(file_info: FileInfo, name_to_summary: dict[str, str]) -> None:
+    """将 LLM 返回的概述回填到 FileInfo 中。"""
+    for func in file_info.functions:
+        if func.name in name_to_summary:
+            func.summary = name_to_summary[func.name]
+    for cls in file_info.classes:
+        if cls.name in name_to_summary:
+            cls.summary = name_to_summary[cls.name]
+        for method in cls.methods:
+            if method.name in name_to_summary:
+                method.summary = name_to_summary[method.name]
+
+
+def _fill_failed_summaries(file_info: FileInfo) -> None:
+    """填充失败的概述文本。"""
+    for func in file_info.functions:
+        if not func.summary:
+            func.summary = "概述生成失败"
+    for cls in file_info.classes:
+        if not cls.summary:
+            cls.summary = "概述生成失败"
+        for method in cls.methods:
+            if not method.summary:
+                method.summary = "概述生成失败"
+
+
+INDIVIDUAL_PROMPT_TEMPLATE = """\
+请为以下 Python 函数/方法生成不超过30字的概述。
+直接描述功能，禁止使用"此函数"等废话。
+
+函数名：{func_name}
+行范围：L{start_line}-L{end_line}
+
+以下是该函数/方法所在文件的完整源代码，请根据行范围定位并分析：
+```python
+{source_code}
+```
+
+只输出概述文本。"""
+
+
+def _fallback_individual_summaries(
+        file_info: FileInfo,
+        missing_names: list[str],
+) -> None:
+    """降级为逐函数请求 LLM 概述。传入完整源码供 LLM 定位分析。"""
+    source_code = file_info.source_code
+
+    for func in file_info.functions:
+        if func.name in missing_names and not func.summary:
+            func.summary = _request_single_summary(
+                func.name, func.start_line, func.end_line, source_code
+            )
+    for cls in file_info.classes:
+        if cls.name in missing_names and not cls.summary:
+            cls.summary = _request_single_summary(
+                cls.name, cls.start_line, cls.end_line, source_code
+            )
+        for method in cls.methods:
+            if method.name in missing_names and not method.summary:
+                method.summary = _request_single_summary(
+                    method.name, method.start_line, method.end_line, source_code
+                )
+
+
+def _request_single_summary(
+        name: str,
+        start_line: int,
+        end_line: int,
+        source_code: str,
+) -> str:
+    """请求单个函数/类的概述。传入完整源码供 LLM 定位。"""
+    prompt = INDIVIDUAL_PROMPT_TEMPLATE.format(
+        func_name=name,
+        start_line=start_line,
+        end_line=end_line,
+        source_code=source_code,
+    )
+    try:
+        result = simple_chat(
+            prompt,
+            temperature=0.3,
+            max_tokens=100,
+            query="/init",
+            turn="TREE_FUNC_SINGLE",
+            timeout=180,
+        )
+        return result.strip().strip('"\'') if result else "概述生成失败"
+    # noinspection PyBroadException
+    except Exception:
+        # LLM/网络层可能抛出任意异常，此处有意兜底为失败占位并继续处理
+        return "概述生成失败"
+
+
+def format_file_detail(file_info: FileInfo) -> str:
+    """
+    将单个 FileInfo 格式化为函数级 Markdown 片段。
+    """
+    lines: list[str] = [
+        f"## 文件：{file_info.file_path}",
+        "",
+        f"> 文件概述：{file_info.file_summary}",
+        "",
+    ]
+
+    has_content = False
+
+    # 函数列表
+    if file_info.functions:
+        has_content = True
+        lines.append("### 函数列表")
+        lines.append("")
+        lines.append("| 函数名 | 行范围 | 函数概述 |")
+        lines.append("|--------|--------|----------|")
+        for func in file_info.functions:
+            lines.append(f"| `{func.name}` | L{func.start_line}-L{func.end_line} | {func.summary} |")
+        lines.append("")
+
+    # 类列表
+    if file_info.classes:
+        has_content = True
+        lines.append("### 类列表")
+        lines.append("")
+        for cls in file_info.classes:
+            lines.append(f"#### 类：`{cls.name}` (L{cls.start_line}-L{cls.end_line})")
+            lines.append("")
+            lines.append(f"> 类概述：{cls.summary}")
+            lines.append("")
+            if cls.methods:
+                lines.append("| 方法名 | 行范围 | 方法概述 |")
+                lines.append("|--------|--------|----------|")
+                for method in cls.methods:
+                    lines.append(f"| `{method.name}` | L{method.start_line}-L{method.end_line} | {method.summary} |")
+                lines.append("")
+
+    if not has_content:
+        lines.append("(无函数或类定义)")
+        lines.append("")
+
+    lines.append("---")
+    return "\n".join(lines)
+
+
+# ============================================================
+# 增量记录管理
+# ============================================================
+
+def load_init_record(record_path: Path) -> dict[str, float]:
+    """
+    加载 .init_record.json，返回文件路径到 mtime 的映射。
+    兼容日期字符串和数字时间戳两种格式。
+    文件不存在或格式损坏时返回空 dict。
+    """
+    if not record_path.is_file():
+        return {}
+    try:
+        content = record_path.read_text(encoding="utf-8")
+        record = json.loads(content)
+        if not isinstance(record, dict):
+            return {}
+        result: dict[str, float] = {}
+        for k, v in record.items():
+            if isinstance(v, (int, float)):
+                result[k] = float(v)
+            elif isinstance(v, str):
+                try:
+                    result[k] = datetime.strptime(v, "%Y-%m-%d %H:%M:%S").timestamp()
+                except ValueError:
+                    continue
+        return result
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {}
+
+
+def save_init_record(record_path: Path, record: dict[str, float]) -> None:
+    """保存 .init_record.json，时间戳转为日期字符串方便人类阅读。"""
+    str_record = {
+        k: datetime.fromtimestamp(v).strftime("%Y-%m-%d %H:%M:%S")
+        for k, v in record.items()
+    }
+    try:
+        record_path.write_text(
+            json.dumps(str_record, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def should_generate(
+        file_path: Path,
+        root_path: Path,
+        record: dict[str, float],
+        summary_file_exists: bool,
+) -> tuple[bool, str, float]:
+    """
+    判断单个文件是否需要重新生成摘要。
+    返回 (need_generate, rel_path, current_mtime)。
+    """
+    # 第一步：摘要文件不存在或为空 → 必须生成
+    if not summary_file_exists:
+        try:
+            current_mtime = float(int(os.path.getmtime(str(file_path))))
+        except OSError:
+            return True, "", 0.0
+        rel_path = str(file_path.relative_to(root_path)).replace("\\", "/")
+        return True, rel_path, current_mtime
+
+    # 第二步：文件不在记录中 → 必须生成
+    rel_path = str(file_path.relative_to(root_path)).replace("\\", "/")
+    try:
+        current_mtime = float(int(os.path.getmtime(str(file_path))))
+    except OSError:
+        return True, rel_path, 0.0
+
+    if rel_path not in record:
+        return True, rel_path, current_mtime
+
+    # 第三步：mtime 变更检测
+    if current_mtime > record[rel_path]:
+        return True, rel_path, current_mtime
+
+    return False, rel_path, current_mtime
+
+
+def parse_old_summary_file(summary_path: Path) -> dict[str, str]:
+    """
+    解析旧的摘要输出文件，提取每个文件的旧摘要内容。
+    返回 dict：key = 文件相对路径，value = 该文件的 Markdown 片段（含标题到---）。
+    """
+    if not summary_path.is_file():
+        return {}
+
+    try:
+        content = summary_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return {}
+
+    result: dict[str, str] = {}
+    # 按 "## 文件：" 分割
+    pattern = r"(## 文件：.+?\n(?:.*?\n)*?---)"
+    matches = re.findall(pattern, content)
+    for match in matches:
+        # 提取文件路径
+        path_match = re.match(r"## 文件：(.+?)\n", match)
+        if path_match:
+            file_path = path_match.group(1).strip()
+            result[file_path] = match
+
+    return result
+
+
+# ============================================================
+# 目录过滤辅助
+# ============================================================
+
+# 常见虚拟环境/依赖目录名，始终跳过
+SKIP_DIR_NAMES = {"venv", ".venv", "virtualenv", "site-packages", "dist-packages", "node_modules"}
+
+# 版本控制元数据目录：.gitignore 不会忽略 VCS 自身目录，树生成时需显式排除
+VCS_DIR_NAMES = {".git", ".svn", ".hg"}
+
+# 包管理器锁文件名：生成物，对代码生成无上下文价值。
+# 仅用于 /init 扫描过滤，不写入 .gitignore —— 锁文件应当提交到 git 以保证可复现构建。
+LOCK_FILE_NAMES = {
+    "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lockb",
+    "poetry.lock", "uv.lock", "Pipfile.lock", "composer.lock",
+    "Gemfile.lock", "Cargo.lock", "go.sum",
+}
+
+
+def is_always_skipped(entry: Path, is_dir: bool) -> bool:
+    """
+    兜底黑名单过滤：无论 .gitignore 是否覆盖，以下内容一律跳过。
+    - 目录：依赖/虚拟环境/缓存目录、构建产物目录（*.egg-info）
+    - 文件：包管理器锁文件、*.log 日志文件
+    仅作为 .gitignore 缺失或遗漏时的防呆兜底，主力仍是 .gitignore 规则。
+    """
+    name = entry.name
+    if is_dir:
+        return (name in SKIP_DIR_NAMES
+                or name == "__pycache__"
+                or name.endswith(".egg-info"))
+    if name in LOCK_FILE_NAMES:
+        return True
+    return name.endswith(".log")
+
+
+def collect_python_files(root_path: Path, gitignore_rules: list[dict]) -> list[Path]:
+    """
+    剪枝式收集项目中所有 Python 文件（含嵌套子项目，如 wdbuddy）。
+    过滤规则与 build_tree 保持一致：
+      - 隐藏目录、__pycache__、依赖/虚拟环境目录
+      - 兜底黑名单（is_always_skipped）
+      - 嵌套 .gitignore 规则（按 scope 生效）
+    遍历时对被忽略目录剪枝（不深入 node_modules 等巨型目录），
+    替代 root.rglob("*.py") 的先全量扫描后过滤，避免性能劣化。
+    """
+    py_files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        dir_path = Path(dirpath)
+        try:
+            rel_dir = str(dir_path.relative_to(root_path)).replace("\\", "/")
+        except ValueError:
+            continue
+
+        # 原地剪枝：被忽略的子目录不深入
+        pruned = []
+        for d in dirnames:
+            if d in VCS_DIR_NAMES:
+                continue
+            if d == "__pycache__" or d in SKIP_DIR_NAMES:
+                continue
+            sub_rel = f"{rel_dir}/{d}" if rel_dir != "." else d
+            if is_ignored_by_gitignore(sub_rel + "/", True, gitignore_rules):
+                continue
+            pruned.append(d)
+        dirnames[:] = pruned
+
+        # 收集当前目录下的 Python 文件
+        for fname in filenames:
+            if not fname.endswith(".py"):
+                continue
+            entry = dir_path / fname
+            if is_always_skipped(entry, False):
+                continue
+            sub_rel = f"{rel_dir}/{fname}" if rel_dir != "." else fname
+            if is_ignored_by_gitignore(sub_rel, False, gitignore_rules):
+                continue
+            py_files.append(entry)
+
+    py_files.sort()
+    return py_files
+
+
+
+
+
+# ============================================================
+# 主函数 create_project_tree（原 main）
+# ============================================================
+
+def _format_duration_s(seconds: float) -> str:
+    """将秒数格式化为人类可读的时间字符串。"""
+    if seconds < 60:
+        return f"{int(seconds)}秒"
+    elif seconds < 3600:
+        return f"{int(seconds // 60)}分{int(seconds % 60)}秒"
+    else:
+        return f"{int(seconds // 3600)}时{int((seconds % 3600) // 60)}分{int(seconds % 60)}秒"
+
+
+def _format_estimated_time(seconds: int) -> str:
+    """格式化预估时间。"""
+    if seconds < 60:
+        return f"约{seconds}秒"
+    elif seconds < 3600:
+        return f"约{seconds // 60}分{seconds % 60}秒"
+    else:
+        return f"约{seconds // 3600}小时{(seconds % 3600) // 60}分"
+
+
+def _prescan_project_files(
+    root_path: Path,
+    gitignore_rules: list[dict],
+    cache: dict[str, tuple[int, str]],
+    record: dict[str, float],
+) -> dict:
+    """
+    预扫描项目文件，统计需要处理的文件数量（模拟 build_tree 的文件收集逻辑）。
+    返回 {"total": N, "new": N, "cached": N}
+    """
+    result = {"total": 0, "new": 0, "cached": 0}
+    _prescan_recursive(root_path, root_path, gitignore_rules, cache, record, result)
+    return result
+
+
+def _prescan_recursive(
+    root_path: Path,
+    current_path: Path,
+    gitignore_rules: list[dict],
+    cache: dict[str, tuple[int, str]],
+    record: dict[str, float],
+    result: dict,
+):
+    """递归预扫描目录，统计文件数量。"""
+    try:
+        entries = sorted(
+            current_path.iterdir(),
+            key=lambda p: (not p.is_dir(), p.name.lower()),
+        )
+    except (PermissionError, OSError):
+        return
+
+    try:
+        rel_path = str(current_path.relative_to(root_path))
+        if rel_path == ".":
+            rel_path = ""
+    except ValueError:
+        rel_path = str(current_path)
+
+    for entry in entries:
+        entry_name = entry.name
+
+        # 同 build_tree 的过滤逻辑
+        if entry.is_dir() and entry_name in VCS_DIR_NAMES:
+            continue
+        if entry_name == '.gitkeep':
+            continue
+        if entry_name.endswith('.docx'):
+            continue
+        if entry_name == '__init__.py':
+            continue
+        if is_always_skipped(entry, entry.is_dir()):
+            continue
+
+        if rel_path:
+            entry_rel = f"{rel_path}/{entry_name}"
+        else:
+            entry_rel = entry_name
+
+        if entry.is_dir():
+            entry_rel_dir = entry_rel + "/"
+            if is_ignored_by_gitignore(entry_rel_dir, True, gitignore_rules):
+                continue
+            _prescan_recursive(root_path, entry, gitignore_rules, cache, record, result)
+        else:
+            if is_binary_extension(entry):
+                continue
+            if is_ignored_by_gitignore(entry_rel, False, gitignore_rules):
+                continue
+
+            # 检查缓存状态
+            abs_path = str(entry.resolve())
+            try:
+                mtime = int(entry.stat().st_mtime)
+            except OSError:
+                mtime = 0
+
+            result["total"] += 1
+
+            is_cached = False
+            if abs_path in cache:
+                cached_mtime, _ = cache[abs_path]
+                if cached_mtime == mtime:
+                    try:
+                        rel = str(entry.relative_to(root_path)).replace("\\", "/")
+                    except ValueError:
+                        rel = entry.name
+                    if rel in record and mtime <= int(record[rel]):
+                        is_cached = True
+
+            if is_cached:
+                result["cached"] += 1
+            else:
+                result["new"] += 1
+
+
+def _prescan_python_files(
+    root_path: Path,
+    gitignore_rules: list[dict],
+    record: dict[str, float],
+    summary_file_exists: bool,
+    old_summaries: dict[str, str],
+) -> dict:
+    """
+    预扫描 Python 文件，统计需要生成摘要的文件数量和函数数量。
+    统计逻辑与实际执行逻辑严格对齐：
+      - not need_gen and rel_path in old_summaries → cached（复用旧摘要）
+      - 否则若 file_info is None → skipped（空文件）
+      - 否则 → new（需调用 LLM 生成）
+    返回 {"total_files": N, "total_funcs": N, "new": N, "cached": N, "skipped": N}
+    """
+    # 剪枝式收集 Python 文件，避免 rglob 全量深入 node_modules 等巨型目录
+    py_files = collect_python_files(root_path, gitignore_rules)
+
+    result = {"total_files": len(py_files), "total_funcs": 0, "new": 0, "cached": 0, "skipped": 0}
+
+    for py_file in py_files:
+        need_gen, rel_path, current_mtime = should_generate(
+            py_file, root_path, record, summary_file_exists
+        )
+
+        # 与实际执行逻辑对齐：not need_gen and rel_path in old_summaries → cached
+        if not need_gen and rel_path in old_summaries:
+            result["cached"] += 1
+            # 从旧摘要中统计函数/方法数（与实际执行一致）
+            old_section = old_summaries[rel_path]
+            result["total_funcs"] += old_section.count("| `")
+        else:
+            # 需要生成新摘要
+            file_info = extract_ast_info(str(py_file))
+            if file_info is None:
+                result["skipped"] += 1
+                continue
+            result["new"] += 1
+            func_count = len(file_info.functions)
+            for cls in file_info.classes:
+                func_count += len(cls.methods)
+            result["total_funcs"] += func_count
+
+    return result
+
+
+def create_project_tree(root_path: Path | None = None, mode: str = "init",
+                        proj_root: str | None = None) -> bool:
+    """
+    创建 MyClaude 项目工程树。
+
+    Args:
+        root_path: 项目根目录路径，None 则使用当前执行目录。
+        mode: init=文件级目录树，init_file=函数级摘要。
+        proj_root: /init --proj_root 传入的项目根目录字符串，优先于 root_path。
+
+    Returns:
+        bool: 成功返回 True，失败返回 False。
+    """
+    if proj_root:
+        root_path = Path(proj_root).expanduser().resolve()
+    elif root_path is None:
+        root_path = Path.cwd()
+    else:
+        root_path = root_path.resolve()
+
+    if not root_path.is_dir():
+        console.print(f"[red]错误：目录不存在 - {root_path}[/red]")
+        return False
+
+    console.print(f"\n[bold]🔍 正在扫描项目: {root_path}[/bold]\n")
+
+    # 解析 .gitignore（含嵌套子项目自身的 .gitignore，如 wdbuddy）
+    gitignore_rules = collect_all_gitignore_rules(root_path)
+
+    # /init 输出目录：B/.wdclaude/init/<转义 project_root>/（init 子目录不存在则逐级创建）
+    init_dir = _paths.init_dir_for(root_path)
+    init_dir.mkdir(parents=True, exist_ok=True)
+
+    # 旧版产物迁移：原存于项目根目录的产物若新目录缺失而旧位置存在，复制迁移以保留增量缓存
+    for _name in (".tree_cache.md", ".tree_cache_data.md", ".init_record.json",
+                  ".project_function.md", ".init_file_record.json"):
+        _old_file = root_path / _name
+        _new_file = init_dir / _name
+        if _old_file.is_file() and not _new_file.exists():
+            try:
+                shutil.copy2(_old_file, _new_file)
+            except OSError:
+                pass
+
+    # 加载缓存和增量记录（均位于 .wdclaude/init/<project_root>/ 之下）
+    cache_data_path = init_dir / ".tree_cache_data.md"
+    tree_output_path = init_dir / ".tree_cache.md"
+    record_path = init_dir / ".init_record.json"
+
+    cache: dict[str, tuple[int, str]] = load_cache(cache_data_path)
+    record: dict[str, float] = load_init_record(record_path)
+
+    # 检查摘要输出文件是否存在且非空
+    tree_cache_exists = tree_output_path.is_file() and tree_output_path.stat().st_size > 0
+
+    # 如果摘要文件不存在，清空缓存强制全量生成
+    if not tree_cache_exists:
+        cache = {}
+
+    # 预扫描：统计文件数量和缓存状态
+    prescan = _prescan_project_files(root_path, gitignore_rules, cache, record)
+    est_seconds = prescan["new"] * 3  # 文件概述 prompt 简短，约 3 秒/文件
+    est_time_str = _format_estimated_time(est_seconds)
+
+    console.print(
+        f"[bold]📊 任务概述[/bold]\n"
+        f"  总共处理文件: {prescan['total']} 个\n"
+        f"  新增/更新: {prescan['new']} 个, 缓存复用: {prescan['cached']} 个\n"
+        f"  预计耗时: {est_time_str}\n"
+    )
+
+    stats: dict = {"total_files": 0, "reused": 0, "generated": 0}
+    start_time = datetime.now()
+
+    # 构建树
+    tree = build_tree(
+        root_path, root_path, gitignore_rules, cache,
+        record=record, stats=stats,
+    )
+
+    if tree is not None:
+        # 原来 console.print(tree) 的地方，改为保存到树形文件
+        console.print("\n[bold]📁 项目目录树：[/bold]")
+        console.print(tree)
+        _save_tree_to_file(tree, tree_output_path, root_path)
+        console.print(f"\n[dim]树形结构已保存到 {tree_output_path}[/dim]")
+    else:
+        console.print("[dim](空目录或所有内容已被忽略)[/dim]")
+
+    # 清理缓存陈旧条目：仅保留本次实际访问过的文件，
+    # 防止 .tree_cache_data.md 残留已被 gitignore/过滤规则排除的文件（如 *.egg-info）
+    visited = stats.get("visited", set())
+    if visited:
+        cache = {p: v for p, v in cache.items() if p in visited}
+
+    # 保存缓存（概述信息表格到独立文件）
+    save_cache(cache_data_path, cache, root_path)
+
+    # 更新并保存增量记录（以清理后的缓存为准，同步剔除陈旧条目）
+    new_record: dict[str, float] = {}
+    for abs_path, (mtime, _) in cache.items():
+        try:
+            rel = str(Path(abs_path).relative_to(root_path)).replace("\\", "/")
+        except ValueError:
+            rel = Path(abs_path).name
+        new_record[rel] = float(mtime)
+    save_init_record(record_path, new_record)
+
+    # /init 模式执行总结
+    end_time = datetime.now()
+    duration = (end_time - start_time).total_seconds()
+    generated = stats["total_files"] - stats["reused"]
+    console.print(f"\n[bold]📊 执行总结[/bold]")
+    console.print(f"  开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    console.print(f"  结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    console.print(f"  总共耗时: {_format_duration_s(duration)}")
+    console.print(f"  总共处理文件: {stats['total_files']} 个")
+    console.print(f"  新增/更新: {generated} 个, 缓存复用: {stats['reused']} 个")
+
+    # === 函数级摘要模式（init_file） ===
+    if mode == "init_file":
+        summary_output_path = init_dir / ".project_function.md"
+
+        # 使用独立的增量记录文件，避免被 /init 模式的记录覆盖
+        file_record_path = init_dir / ".init_file_record.json"
+
+        # 加载增量记录
+        record = load_init_record(file_record_path)
+
+        # 解析旧摘要文件（用于保留未变更文件的内容）
+        old_summaries = parse_old_summary_file(summary_output_path)
+
+        # 剪枝式收集 Python 文件，避免 rglob 全量深入 node_modules 等巨型目录
+        py_files = collect_python_files(root_path, gitignore_rules)
+
+        # 预扫描：统计函数级摘要的文件和函数数量
+        summary_file_exists = summary_output_path.is_file() and summary_output_path.stat().st_size > 0
+        prescan = _prescan_python_files(root_path, gitignore_rules, record, summary_file_exists, old_summaries)
+        est_seconds = prescan["new"] * 35  # 函数级摘要 prompt 含完整源码，LLM调用约35秒/新文件
+        est_time_str = _format_estimated_time(est_seconds)
+
+        console.print(
+            f"\n[bold]📊 任务概述[/bold]\n"
+            f"  总共处理文件: {prescan['total_files']} 个\n"
+            f"  总共处理函数: {prescan['total_funcs']} 个\n"
+            f"  新增/更新: {prescan['new']} 个文件, 缓存复用: {prescan['cached']} 个文件, 跳过: {prescan['skipped']} 个文件（空文件）\n"
+            f"  预计耗时: {est_time_str}\n"
+        )
+
+        new_record: dict[str, float] = dict(record)  # 保留旧记录（来自 .init_file_record.json）
+        generated_count = 0
+        reused_count = 0
+        skipped_count = 0
+        total_funcs = 0
+        file_start_time = datetime.now()
+
+        console.print(f"\n[bold]📝 正在生成函数级摘要（共 {len(py_files)} 个 Python 文件）...[/bold]\n")
+
+        # 先写入文件头部，后续逐文件追加
+        header_lines = [
+            f"# 项目函数级摘要 for {root_path}",
+            f"",
+            f"# 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"",
+        ]
+        summary_output_path.write_text("\n".join(header_lines) + "\n", encoding="utf-8")
+
+        for py_file in py_files:
+            need_gen, rel_path, current_mtime = should_generate(
+                py_file, root_path, record, summary_file_exists
+            )
+
+            if not need_gen and rel_path in old_summaries:
+                # 复用旧摘要 —— 直接追加写入文件
+                with open(summary_output_path, "a", encoding="utf-8") as f:
+                    f.write(old_summaries[rel_path] + "\n")
+                new_record[rel_path] = current_mtime
+                reused_count += 1
+                # 统计旧摘要中的函数/方法数
+                old_section = old_summaries[rel_path]
+                total_funcs += old_section.count("| `")
+            else:
+                # 生成新摘要
+                file_info = extract_ast_info(str(py_file))
+                if file_info is None:
+                    new_record[rel_path] = current_mtime
+                    skipped_count += 1
+                    console.print(f"  [yellow]⏭️ {rel_path} — 已跳过（空文件）[/yellow]")
+                    continue
+
+                file_info.file_path = rel_path
+                # 从缓存中获取文件级概述
+                abs_path = str(py_file.resolve())
+                file_info.file_summary = cache.get(abs_path, (0, ""))[1] or ""
+
+                batch_generate_summaries(file_info)
+                section = format_file_detail(file_info)
+
+                # 统计函数/方法数
+                total_funcs += len(file_info.functions)
+                for cls in file_info.classes:
+                    total_funcs += len(cls.methods)
+
+                # 立即追加写入文件，方便快速调试
+                with open(summary_output_path, "a", encoding="utf-8") as f:
+                    f.write(section + "\n")
+
+                new_record[rel_path] = current_mtime
+                generated_count += 1
+
+                console.print(f"  [green]📝 {rel_path} — 函数级摘要已生成[/green]")
+
+        # 保存增量记录（使用独立文件）
+        save_init_record(file_record_path, new_record)
+
+        file_end_time = datetime.now()
+        file_duration = (file_end_time - file_start_time).total_seconds()
+
+        console.print(f"\n[bold]📝 函数级摘要已保存到 {summary_output_path}[/bold]")
+        console.print(f"[dim]新增 {generated_count} 个文件, 复用 {reused_count} 个文件[/dim]")
+
+        # /init file 模式执行总结
+        console.print(f"\n[bold]📊 执行总结[/bold]")
+        console.print(f"  开始时间: {file_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        console.print(f"  结束时间: {file_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        console.print(f"  总共耗时: {_format_duration_s(file_duration)}")
+        console.print(f"  总共处理文件: {len(py_files)} 个")
+        console.print(f"  总共处理函数: {total_funcs} 个")
+        console.print(f"  新增/更新: {generated_count} 个文件, 缓存复用: {reused_count} 个文件, 跳过: {skipped_count} 个文件（空文件）")
+
+    return True
+
+
+# 保留 main 作为独立运行的兼容入口
+def main() -> None:
+    """独立命令行运行入口（兼容旧用法）。"""
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="MyClaude 目录地图可视化生成器",
+    )
+    parser.add_argument(
+        "root",
+        nargs="?",
+        default=None,
+        help="项目根目录路径（可选，默认当前执行目录）",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["init", "init_file"],
+        default="init",
+        help="执行模式：init=文件级树形摘要，init_file=函数级摘要",
+    )
+    args = parser.parse_args()
+
+    if args.root:
+        root_path = Path(args.root).resolve()
+    else:
+        root_path = Path.cwd()
+
+    create_project_tree(root_path, mode=args.mode)
+
+
+if __name__ == "__main__":
+    main()

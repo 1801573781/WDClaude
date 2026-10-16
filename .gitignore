@@ -1,0 +1,32 @@
+# ===== Python 运行时与工具缓存 =====
+*.pyc
+__pycache__/
+venv/
+.venv/
+.idea/
+.pytest_cache/
+.ruff_cache/
+
+# ===== Python 构建产物（setuptools/pip 生成，不入 git，/init 目录树同步排除）=====
+*.egg-info/
+build/
+*.egg
+
+# ===== .wdclaude 运行数据（v2.0 数据目录 wdclaude_v2_launch_data_model.md Phase A，/init 目录树同步排除）=====
+.wdclaude/log/
+.wdclaude/memory_storage/
+.wdclaude/token_statistics/
+.wdclaude/tmp_output/
+.wdclaude/backups/
+.wdclaude/cache/
+.wdclaude/init/
+.wdclaude/data/
+.wdclaude/logo/
+.wdclaude/settings.local.json
+.wdclaude/config/model_key.yaml
+.wdclaude/skills/openspec-*/
+
+# ===== 跨语言通用噪声（无前导斜杠，对任意层级生效，含嵌套子项目如 wdbuddy）=====
+node_modules/
+dist/
+*.log

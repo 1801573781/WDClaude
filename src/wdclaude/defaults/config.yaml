@@ -1,0 +1,72 @@
+# WDClaude 全局配置文件（v0.2.0 Phase 2 新形态，设计文档 7.2）
+# 修改后重启生效
+# base_path 段已删除：路径由 PathResolver 动态计算（Agent 模式下 B=cwd）
+
+# model api_key 配置文件，换到model_key.yaml
+
+# 模型交互基本参数
+model_chat:
+  initial_max_tokens: 90000  # 单次请求 token 上限，初始化值（如果与 LLM 交互失败，重试的时候，还会增加这个值）
+  max_retries: 3             # 与 LLM 交互，如果失败，重试次数
+  max_tokens_limit: 640000   # 单次请求 token 上限，最终值（不会比这个更高的）
+  temperature: 0.3           # 创造性程度
+
+# 工具解析配置（独立于模型，与具体模型解耦）
+tool_parse:
+  from_reasoning: False      # 是否在 content 未解析到工具时，从 reasoning_content 宽松匹配工具标签
+
+# 记忆系统存储配置
+memory:
+  backend: "memory_ex"                                # 记忆后端: memory_ex / none（新用户默认开启，决策 10.2-4）
+
+# 场景识别配置（设计文档 8.2）
+scenario:
+  self_mode_markers: ["pyproject.toml"]   # Self 模式标记文件（cwd 向上 3 级内命中且包名=wdclaude 即 SELF）
+
+# 项目基本目录结构
+# [Phase 2 删除] base_path 段整体删除——路径全部由 PathResolver 动态计算（设计文档 7.2）
+# project_root / spec_root / skill_root / code_output_root → B 锚点
+# logs_root / backups_root → A2（~/.wdclaude）
+
+# 命令行界面配置
+cli:
+  theme: "monokai"        # rich 主题风格
+  typewriter_delay: 0.005 # 打字机效果延迟（秒），0 为关闭
+  max_turns: 500           # 工具调用最大轮次
+  show_thinking: False    # 是否显示 <thinking> 内容
+
+# 斜杠命令系统配置
+command:
+  cmd_dir: ".wdclaude/commands"    # 命令目录名（相对于项目根目录）
+  auto_scan: true         # 启动时自动扫描
+  profile: "core"         # 工作流模式：core 或 expanded
+
+# API 兼容性约束
+api_constraints:
+  system_role_only_at_start:
+    providers: ["minimax"]  # 哪些 provider 限制 system 角色只能出现在消息列表首位
+
+# log配置
+log:
+  format: "html"   # 可选 "md" 或 "html"
+
+# 优雅退出配置（ShutdownCoordinator）
+shutdown:
+  confirm_on_ctrl_c: true          # Ctrl+C 退出是否二次确认（回车取消 / y 或再按 Ctrl+C 确认）
+  save_session_html_on_exit: true  # 退出时自动保存屏幕输出为 HTML 到 logs 目录
+  kill_a2a_on_exit: "never"        # A2A 服务子进程处置: never(保留,默认,服务可复用) / always(终止) / ask(询问)
+  cleanup_timeout_seconds: 10.0    # 退出清理链总超时（秒），超时放弃剩余清理直接退出
+
+# 互联网搜索工具配置（参数类；密钥在 model_key.yaml 的 web_search 段）
+web_search:
+  enabled: true          # 功能总开关（true=启用联网搜索）
+  trigger_mode: private  # 触发模式: auto=LLM自主 / explicit=仅用户明确要求 / private=自主但query仅限通用词汇
+  sensitive_words: []    # 额外受保护词汇（query命中即拒绝），如 ["MyClaude", "某内部项目名"]
+  max_results: 5          # 默认返回条数
+  timeout: 10             # HTTP 超时（秒）
+  max_retries: 2          # 失败重试次数（指数退避）
+  cache_ttl: 3600         # 搜索结果本地缓存有效期（秒），0 为禁用缓存
+  token_budget: 3000      # 单次结果注入的 token 预算
+  min_interval: 2.0       # 两次真实搜索的最小间隔（秒），防止刷配额
+  fallback_model: "glm-4-flash"  # zhipu 降级链路 chat 模型（主搜索接口无召回时自动降级，403修复）
+  fallback_max_results: 5        # 降级链路最多提取的结果条数

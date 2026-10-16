@@ -1,0 +1,77 @@
+memory_ex:
+  storage:
+    base_dir: "D:/ai/wdclaude/memory_storage/memory_ex/"
+    layer1_file: "memory/MEMORY.md"
+    metadata_file: "memory/metadata.json"
+
+  watermarks:
+    warning: 150
+    trigger: 180
+    hard_limit: 200
+    target_after: 160
+
+  auto_compaction:
+    enabled: false
+    light_query_interval: 10
+    mode: "full"
+
+  auto_evolution:
+    enabled: false
+    accumulation_threshold: 10
+    trend_query_interval: 200
+    batch_size: 50
+
+  extractor:
+    model: "default"
+    temperature: 0.2
+    max_tokens: 2048
+    max_entries_per_query: 3
+    timeout: 120             # LLM 提取超时秒数（非流式调用，建议 60~180）
+    raw_prompt_threshold: 10 # raw 条目累积到此数量时提示用户执行 /mem extract
+
+  compactor:
+    model: "default"
+    temperature: 0.3
+    max_tokens: 2048
+
+  evolver:
+    model: "default"
+    temperature: 0.3
+    max_tokens: 1024
+
+  scoring:
+    recency_weight: 0.20
+    relevance_weight: 0.25
+    user_explicit_weight: 0.20
+    cross_module_weight: 0.10
+    access_frequency_weight: 0.15
+    code_absorbed_penalty: 0.40
+    recency_halflife_days: 7
+    access_frequency_max: 10
+
+  retrieval:
+    # 召回策略：coarse_only / coarse_llm / coarse_rerank / llm_only / rerank_only
+    strategy: "coarse_llm"
+    default_top_k: 5
+    max_top_k: 20
+
+    # ── 粗排参数（向量召回） ──
+    vector:
+      top_k: 5                # 粗排返回候选数
+      score_threshold: 0.4     # 向量相似度最低阈值
+
+    # ── LLM精排参数 ──
+    llm_rerank:
+      max_results: 3           # 精排最终返回最多条数
+      timeout: 30              # LLM精排超时秒数
+
+    # ── Rerank模型精排参数 ──
+    rerank:
+      max_results: 3           # 精排最终返回最多条数
+      timeout: 30              # rerank API超时秒数
+
+    # ── 降级策略 ──
+    fallback_to_full: true     # 索引不存在时是否降级为全量召回
+
+  injection:
+    max_tokens: 2000

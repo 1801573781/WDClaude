@@ -1,0 +1,1516 @@
+import math
+import os
+import re
+import time
+from contextlib import contextmanager
+from html import escape as html_escape  # 用于 HTML 转义
+from html.parser import HTMLParser
+from pathlib import Path
+
+from rich.markup import escape
+from rich.cells import cell_len
+from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.table import Table
+from rich.prompt import Prompt
+from datetime import datetime
+from rich.text import Text
+
+
+# WDClaude Code 风格的 CLI 界面
+
+# ============================
+# HTML 缓冲区（用于 /save 命令）
+# ============================
+_html_parts = []  # 累积所有屏幕输出的 HTML 片段
+_interaction_starts = []  # 记录每次用户输入时 _html_parts 的索引，用于按交互保存
+
+
+# 自定义样式
+STYLES = {
+    "user": "bold bright_cyan",
+    "assistant": "bold bright_green",
+    "system": "italic",
+    "error": "bold red",
+    "info": "bright_cyan",
+    "timestamp": "white",
+    "header": "bold bright_cyan",
+    "border": "bright_cyan",
+}
+
+# 颜色常量
+COLORS = {
+    "primary": "#22d3ee",  # bright_cyan
+    "secondary": "#4ade80",  # bright_green
+    "accent": "#22d3ee",  # bright_cyan
+    "background": "#1E1E2E",  # 深色背景
+    "surface": "#2D2D3F",  # 表面色
+    "text": "#E2E8F0",  # 文本色
+    "muted": "#E2E8F0",  # 默认文本色
+}
+
+# ============================
+# 歧义宽度字符清洗（Windows 终端显示兜底）
+# ============================
+# 带圈数字（Unicode U+2460 起的 ①-⑳）、带括号数字（U+2474 起的 ⑴-⑳）等
+# East Asian Ambiguous 宽度字符：Windows 终端按窄字符（1列）推进光标，
+# 中文字体却按宽字形（2列）渲染，后一个字符会被画进其右半区产生重叠
+# （如"①"与"测"部分重叠）。提示词层已禁止 LLM 输出此类字符，此处为
+# 代码层兜底：终端显示路径统一替换为 ASCII 等价形式，语义不变。
+_AMBIGUOUS_WIDTH_MAP = {chr(0x2460 + i): f"({i + 1})" for i in range(20)}         # ①-⑳
+_AMBIGUOUS_WIDTH_MAP.update({chr(0x2474 + i): f"({i + 1})" for i in range(20)})  # ⑴-⑳
+
+
+def _sanitize_ambiguous_width(text: str) -> str:
+    """将歧义宽度字符替换为 ASCII 等价形式（用于终端显示路径）。"""
+    if not text:
+        return text
+    return "".join(_AMBIGUOUS_WIDTH_MAP.get(ch, ch) for ch in text)
+
+
+# 强制 Rich 走 UTF-8 模式，避免在 Docker 沙箱/旧控制台等环境中回退到 GBK legacy 渲染器
+# 引发 UnicodeEncodeError（如 emoji ❌✅ 无法被 GBK 编码）
+os.environ["PYTHONIOENCODING"] = "utf-8"
+console = Console(force_terminal=True, legacy_windows=False)
+
+
+def _init_win_vt():
+    """启用 Windows 虚拟终端处理和自动换行。
+
+    确保终端能正确解释 ANSI 转义序列（颜色等），并保证光标到行尾时自动换行。
+    若未启用 VT 处理，ANSI 码被当作可见字符，导致行宽计算错误，
+    长输入换行时光标回到行首覆盖已有内容。
+    """
+    if os.name != 'nt':
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_ulong()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            # ENABLE_PROCESSED_OUTPUT(0x1) | ENABLE_WRAP_AT_EOL_OUTPUT(0x2) | ENABLE_VIRTUAL_TERMINAL_PROCESSING(0x4)
+            kernel32.SetConsoleMode(handle, mode.value | 0x7)
+    except Exception:
+        pass
+
+
+_init_win_vt()
+
+# Windows 控制台结构体定义（用于 GetConsoleScreenBufferInfo 读取/恢复文本属性）
+if os.name == 'nt':
+    import ctypes
+
+    class _COORD(ctypes.Structure):
+        _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+    class _SMALL_RECT(ctypes.Structure):
+        _fields_ = [("Left", ctypes.c_short), ("Top", ctypes.c_short),
+                    ("Right", ctypes.c_short), ("Bottom", ctypes.c_short)]
+
+    class _CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", _COORD),
+            ("dwCursorPosition", _COORD),
+            ("wAttributes", ctypes.c_ushort),
+            ("srWindow", _SMALL_RECT),
+            ("dwMaximumWindowSize", _COORD),
+        ]
+
+
+def _append_html(html_fragment: str):
+    """将 HTML 片段追加到全局缓冲区。"""
+    _html_parts.append(html_fragment)
+
+
+def save_buffer_to_file(filepath: str, all: bool = True):
+    """
+    将累积的 HTML 缓冲区保存为完整的 HTML 文件，可双击用浏览器打开。
+    Args:
+        filepath: 保存路径
+        all: True 保存全部对话；False 只保存最后一次人-LLM 交互（当前 /save 默认行为由调用方决定）
+    文件名扩展名决定行为：
+      - .html / .htm → 直接保存 HTML
+      - .doc / .docx → 保存为 HTML（Word 能打开 HTML 文件）
+      - 其他 → 自动添加 .html 后缀
+    """
+    path = Path(filepath)
+    ext = path.suffix.lower()
+
+    # 统一保存为 HTML 格式（Word 也能直接打开 HTML 文件）
+    if ext == '.html' or ext == '.htm' or ext == '.doc' or ext == '.docx' or ext == '.pdf':
+        # 用原路径
+        html_path = path.with_suffix('.html') if ext not in ('.html', '.htm') else path
+    else:
+        # 无扩展名或未知扩展名，强制改为 .html
+        html_path = path.with_suffix('.html')
+
+    # 根据 all 参数选择保存范围
+    if all or not _interaction_starts:
+        parts_to_save = _html_parts
+    else:
+        # 保存最后一次交互：从最后一个 _interaction_starts 到末尾
+        start_idx = _interaction_starts[-1]
+        parts_to_save = _html_parts[start_idx:]
+
+    all_html = "\n".join(parts_to_save)
+
+    full_html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>WDClaude Session</title>
+<style>
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: #1E1E2E;
+    color: #E2E8F0;
+    padding: 20px;
+    max-width: 900px;
+    margin: 0 auto;
+    line-height: 1.6;
+}}
+</style>
+</head>
+<body>
+{all_html}
+</body>
+</html>"""
+
+    html_path.write_text(full_html, encoding='utf-8')
+    return str(html_path)
+
+
+# ============================
+# 屏幕输出缓冲 → Markdown 存档
+# ============================
+
+# 屏幕缓冲中的时间戳格式（print_user_input / typewriter_then_markdown 追加）
+_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+
+
+class _ScreenBufferHTMLParser(HTMLParser):
+    """将屏幕输出 HTML 片段解析为 (kind, text) 块序列。
+
+    覆盖 cli_print 各打印函数追加到 _html_parts 的标签组合：
+    - 用户输入：div > span("👤 You") + span(时间) + div(内容)
+    - LLM 应答：div > span("🤖 WDClaude") + span(时间) + pre(内容)
+    - 思考过程：details > summary("💭 …") + pre(内容)
+    - 工具调用/提示/错误：p（可后跟 pre）
+    - 欢迎面板：div > h1 + pre
+    - 命令提示/提问/TODO：嵌套 div + br
+
+    kind 取值：header（角色行）/ summary（折叠标题）/ code（原样内容）/ text（普通文本）
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.blocks: list[tuple[str, str]] = []
+        self._pre_buf: list[str] | None = None
+        self._span_buf: list[str] | None = None
+        self._h1_buf: list[str] | None = None
+        self._summary_buf: list[str] | None = None
+        self._text_buf: list[str] = []
+        self._div_depth = 0
+        self._pending_role = ""
+        self._pending_ts = ""
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "pre":
+            self._pre_buf = []
+        elif tag == "span":
+            self._span_buf = []
+        elif tag == "h1":
+            self._h1_buf = []
+        elif tag == "summary":
+            self._summary_buf = []
+        elif tag == "div":
+            self._div_depth += 1
+        elif tag == "br":
+            self._text_buf.append("\n")
+        elif tag == "hr":
+            self._text_buf.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag == "pre":
+            text = "".join(self._pre_buf or [])
+            self._pre_buf = None
+            self._flush_pending_header()
+            if text.strip():
+                self.blocks.append(("code", text))
+        elif tag == "span":
+            text = "".join(self._span_buf or []).strip()
+            self._span_buf = None
+            if "👤" in text:
+                self._pending_role = "👤 You"
+            elif "🤖 WDClaude" in text:
+                self._pending_role = "🤖 WDClaude"
+            elif _TS_RE.fullmatch(text):
+                self._pending_ts = text
+        elif tag == "h1":
+            text = "".join(self._h1_buf or []).strip()
+            self._h1_buf = None
+            if text:
+                self.blocks.append(("header", text))
+        elif tag == "summary":
+            text = "".join(self._summary_buf or []).strip()
+            self._summary_buf = None
+            if text:
+                self.blocks.append(("summary", text))
+        elif tag == "p":
+            self._flush_pending_header()
+            self._flush_text()
+        elif tag == "div":
+            self._div_depth -= 1
+            if self._div_depth <= 0:
+                self._div_depth = 0
+                self._flush_pending_header()
+                self._flush_text()
+            elif self._text_buf and not "".join(self._text_buf).endswith("\n"):
+                self._text_buf.append("\n")
+
+    def handle_data(self, data):
+        if self._pre_buf is not None:
+            self._pre_buf.append(data)
+        elif self._span_buf is not None:
+            self._span_buf.append(data)
+        elif self._h1_buf is not None:
+            self._h1_buf.append(data)
+        elif self._summary_buf is not None:
+            self._summary_buf.append(data)
+        else:
+            self._text_buf.append(data)
+
+    def _flush_pending_header(self):
+        """将已识别的角色 span（含时间戳）产出为 header 块。"""
+        if self._pending_role:
+            header = self._pending_role
+            if self._pending_ts:
+                header += f" （{self._pending_ts}）"
+            self.blocks.append(("header", header))
+        self._pending_role = ""
+        self._pending_ts = ""
+
+    def _flush_text(self):
+        """将累积的普通文本产出为 text 块（空白文本丢弃）。"""
+        text = "".join(self._text_buf)
+        self._text_buf = []
+        if text.strip():
+            self.blocks.append(("text", text.strip()))
+
+
+def _md_fence(text: str) -> str:
+    """计算围栏长度：内容含 ``` 时自动加长，避免围栏被内容打断。"""
+    runs = re.findall(r"`+", text)
+    longest = max((len(r) for r in runs), default=0)
+    return "`" * max(3, longest + 1)
+
+
+def _assemble_screen_markdown(blocks: list[tuple[str, str]]) -> str:
+    """将解析出的块序列组装为 Markdown 文本。"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = ["# WDClaude 屏幕输出存档", "", f"> 生成时间：{now}", ""]
+    if not blocks:
+        lines.append("*（无屏幕输出内容）*")
+    for kind, text in blocks:
+        if kind == "header":
+            lines.append(f"## {text}")
+            lines.append("")
+        elif kind == "summary":
+            lines.append(f"### {text}")
+            lines.append("")
+        elif kind == "code":
+            fence = _md_fence(text)
+            lines.append(fence)
+            lines.append(text.rstrip("\n"))
+            lines.append(fence)
+            lines.append("")
+        else:
+            lines.append(text)
+            lines.append("")
+    result = "\n".join(lines)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result + "\n"
+
+
+def save_buffer_to_markdown(filepath: str, all: bool = True):
+    """将累积的屏幕输出缓冲保存为 Markdown 文件。
+
+    与 save_buffer_to_file 的 HTML 存档同源（_html_parts）：解析 HTML
+    片段还原为 Markdown——用户输入/LLM 应答转为角色标题 + 围栏代码块，
+    思考过程转为三级标题 + 围栏块，工具调用与提示转普通文本。
+
+    Args:
+        filepath: 保存路径（非 .md 后缀时自动改为 .md）
+        all: True 保存全部对话；False 只保存最后一次人-LLM 交互
+
+    Returns:
+        实际保存的文件路径字符串
+    """
+    path = Path(filepath)
+    if path.suffix.lower() != ".md":
+        path = path.with_suffix(".md")
+
+    # 根据 all 参数选择保存范围（与 save_buffer_to_file 保持一致）
+    if all or not _interaction_starts:
+        parts_to_save = _html_parts
+    else:
+        parts_to_save = _html_parts[_interaction_starts[-1]:]
+
+    parser = _ScreenBufferHTMLParser()
+    for fragment in parts_to_save:
+        parser.feed(fragment)
+    parser.close()
+
+    md_content = _assemble_screen_markdown(parser.blocks)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(md_content, encoding="utf-8")
+    return str(path)
+
+
+def clear_screen():
+    """清屏"""
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+
+def print_error(content: str):
+    """打印错误消息"""
+    safe_content = escape(_sanitize_ambiguous_width(content))
+    console.print(f"\n[{STYLES['error']}]❌ Error: {safe_content}[/{STYLES['error']}]\n")
+    _append_html(f'<p style="color:#ef4444;">❌ Error: {html_escape(content)}</p>')
+
+
+def print_info(content: str):
+    """打印通用消息（带前后空行，用于独立的关键提示）"""
+    safe_content = escape(_sanitize_ambiguous_width(content))
+    console.print(f"\n[{STYLES['info']}]{safe_content}[/{STYLES['info']}]\n")
+    _append_html(f'<p style="color:#22d3ee;">{html_escape(content)}</p>')
+
+
+def print_detail(content: str):
+    """打印详细信息（无 ✅ 前缀、无额外空行，紧跟 print_info 后展示附属信息）"""
+    safe_content = escape(_sanitize_ambiguous_width(content))
+    console.print(f"[{STYLES['info']}]{safe_content}[/{STYLES['info']}]")
+    _append_html(f'<p style="color:#22d3ee;">{html_escape(content)}</p>')
+
+
+def print_user_input(content: str):
+    """打印消息"""
+    # 记录本次交互的 HTML 起始索引
+    _interaction_starts.append(len(_html_parts))
+
+    role_emoji = "👶"
+    role_color = "bold bright_cyan"
+    role_name = "You"
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 用户消息使用简单的文本显示
+    console.print(
+        f"\n[{role_color}]{role_emoji} {role_name}[/{role_color}] [white]{timestamp}[/white]")
+    # 关键修复：content 用 Text 对象包裹，禁止 Rich 将用户输入解析为 markup。
+    # 用户粘贴含 [/bash]、[1] 等方括号文本时，字符串会被 Panel 当 markup 渲染，
+    # 未配对闭合标签直接抛 MarkupError 导致程序崩溃退出。
+    console.print(Panel(
+        Text(content),
+        border_style=role_color,
+        padding=(1, 2),
+        width=console.width - 2
+    ))
+
+    console.print()
+
+    # 追加到 HTML 缓冲区
+    _append_html(f'<div style="margin:12px 0;">'
+                 f'<span style="color:#22d3ee;">👤 You</span> '
+                 f'<span>{html_escape(timestamp)}</span>'
+                 f'<div style="border:1px solid #22d3ee; border-radius:4px; padding:8px; margin-top:4px;">'
+                 f'{html_escape(content)}'
+                 f'</div></div>')
+
+
+def print_welcome():
+    """打印欢迎信息"""
+
+    welcome_text = """
+# 🤖 WDClaude Code CLI
+
+Welcome to WDClaude Code CLI! A beautiful terminal interface for AI Coding.
+
+> **首次使用**：编辑 `.wdclaude/config/model_key.yaml`，将 `***` 替换为你的真实 API Key（修改后重启生效）。
+
+## Features
+- 💬 Chat with AI in a modern interface
+- 📝 Markdown rendering support
+- 🎨 Syntax highlighting for code blocks
+- ⌨  Command shortcuts
+- 📋 Copy messages to clipboard
+
+## Commands
+- `/cls` - Clear Screen
+- `/help` - Show this help message
+- `/tokens` - Show the tokens statistics
+- `/t number` - 展开指定 Turn 的思考过程
+- `/new session` - 开启新 Session（清空上下文 + 清空记忆 + 新日志文件）
+- `/mem` - memory相关命令，输入 /mem 查看命令列表
+- `/bug` - bug base相关命令，输入 /bug 查看命令列表
+- `/init [--proj_root <路径>]` - 创建WDClaude的项目工程树（--proj_root 指定项目根目录，不指定则为当前目录）
+- `/init [--proj_root <路径>] file` - 创建函数级摘要 (简写 /init f)
+- `/proj_root` - 显示当前 Project Root（未设置时提示使用 /init 设置）
+- `/cs [<目录>]` - 统计项目代码行数（无参数统计项目根目录；绝对路径直接使用；相对路径以项目根目录为父目录）
+- `/test` - 单元测试和系统测试，/test --help 显示test命令帮助信息
+- `/opsx` - openspec相关命令，输入 /opsx 查看命令列表
+- `/h2m <p1> <p2> [<p3>] [<p4>]` - 将 Session Log HTML 转换为 Markdown（参数值含空格请用引号）
+- `/save <filename> [all]` - Save last interaction (or all with "all" flag) to HTML file
+- `/quit` or `/exit` - Exit the application
+
+---
+
+*Start typing to begin your conversation!*
+"""
+
+    console.print(Panel(
+        Markdown(welcome_text),
+        title="[bold bright_cyan]WDClaude Code CLI[/bold bright_cyan]",
+        border_style="bright_cyan",
+        padding=(1, 2)
+    ))
+
+    # HTML 缓冲区：欢迎信息文本（Markdown 格式无渲染，纯文本存储）
+    _append_html('<div style="border:2px solid #22d3ee; border-radius:8px; padding:12px; margin-bottom:16px;">'
+                 '<h1 style="color:#22d3ee; margin:0 0 12px 0; font-size:28px; border-bottom:2px solid #22d3ee; padding-bottom:8px; text-align:center;">🤖 WDClaude Code CLI</h1>'
+                 '<pre style="color:#e2e8f0; white-space:pre-wrap; font-family:inherit;">'
+                 + html_escape(welcome_text) +
+                 '</pre></div>')
+
+
+def print_banner():
+    """打印 ASCII 艺术 banner"""
+    banner = """
+╔══════════════════════════════════════════════════════════════╗
+║                                                              ║
+║                       W D C L A U D E                        ║
+║                                                              ║
+║                    [ CLI Interface v2.0 ]                    ║
+╚══════════════════════════════════════════════════════════════╝
+    """
+    console.print(f"[bold bright_cyan]{banner}[/bold bright_cyan]")
+    console.print()
+
+
+def print_header(session_id):
+    """打印头部信息"""
+    header_table = Table(show_header=False, box=None, padding=0)
+    header_table.add_column(style="bright_cyan")
+    header_table.add_column(style="bright_cyan", justify="right")
+
+    time_str = datetime.now().strftime("%H:%M:%S")
+    header_table.add_row(
+        f"🤖 WDClaude CLI | Session: {session_id}",
+        f"🕐 {time_str}"
+    )
+
+    console.print(header_table)
+    console.print("─" * console.width)
+
+
+def print_timestamp(timestamp):
+    console.print(
+        f"\n[bold bright_green]🤖 WDClaude[/bold bright_green] "
+        f"[white]{timestamp}[/white]"
+    )
+
+
+# 打印空行
+def print_blank():
+    console.print()
+
+
+def typewriter_print(text, delay=0.005):
+    """打字机效果逐字输出，完整支持 Rich markup（如 [bold red]...[/bold red]）
+
+    Args:
+        text: 可能包含 Rich markup 的字符串
+        delay: 字符间延迟（秒）
+    """
+
+    # 1. 将 markup 解析为 Rich 内部带样式的 Text 对象
+    #    文本含未配对的 [/bash] 等非法 markup 时，降级为纯文本，避免 MarkupError 崩溃
+    try:
+        rich_text = Text.from_markup(text)
+    except Exception:
+        rich_text = Text(text)
+
+    # 2. 逐字符提取：纯文本字符 + 该偏移位置的合成样式
+    for offset, char in enumerate(rich_text.plain):
+        # 获取该字符上叠加的所有 span 样式（自动处理嵌套/重叠标签）
+        style = rich_text.get_style_at_offset(console, offset)
+        # 用 console.print 输出单个字符，应用其样式，不换行
+        console.print(char, end="", style=style)
+        if delay:
+            time.sleep(delay)
+
+    # 3. 全部输出完后统一换行
+    console.print()
+
+
+# 扫描 Markdown 代码块（三反引号）与行内代码（单反引号）的范围，供标签保护跳过。
+def _find_md_code_ranges(text: str) -> list:
+    ranges = []
+    pos = 0
+    in_fence = False
+    fence_start = 0
+    in_inline = False
+    inline_start = 0
+
+    while pos < len(text):
+        if text[pos:pos + 3] == '```':
+            if in_fence:
+                ranges.append((fence_start, pos + 3))
+                in_fence = False
+            else:
+                if in_inline:
+                    ranges.append((inline_start, pos))
+                    in_inline = False
+                in_fence = True
+                fence_start = pos
+            pos += 3
+            continue
+        if not in_fence and text[pos] == '`':
+            if in_inline:
+                ranges.append((inline_start, pos + 1))
+                in_inline = False
+            else:
+                in_inline = True
+                inline_start = pos
+            pos += 1
+            continue
+        if in_inline and text[pos] in '\n\r':
+            ranges.append((inline_start, pos))
+            in_inline = False
+            pos += 1
+            continue
+        pos += 1
+
+    if in_fence:
+        ranges.append((fence_start, len(text)))
+    if in_inline:
+        ranges.append((inline_start, len(text)))
+    return ranges
+
+
+_ANGLE_TAG_RE = re.compile(r'</?[a-zA-Z_][a-zA-Z0-9_-]*(?:\s[^<>\n]*)?/?>')
+
+
+# 保护正文中的尖括号标签文本（如 done、file_view 标签）：
+# Rich 的 Markdown 渲染器会静默丢弃 raw HTML token，正文中出现的工具标签
+# 文本直接消失，用户看到内容被一段神秘代码截断（408 现场）。
+# 将代码块/行内代码之外的标签包裹为行内代码，保证完整显示。
+def _protect_angle_tags_for_markdown(text: str) -> str:
+    ranges = _find_md_code_ranges(text)
+
+    def _sub(m):
+        for cs, ce in ranges:
+            if cs <= m.start() < ce:
+                return m.group(0)
+        return f'`{m.group(0)}`'
+
+    return _ANGLE_TAG_RE.sub(_sub, text)
+
+
+def typewriter_then_markdown(text: str, delay: float = 0.005):
+    """
+    先逐字打字机显示纯文本，全部完成后原地替换为 Markdown 渲染效果。
+    当文本较长（超过终端可见高度的 2/3）时，跳过打字机效果直接渲染，
+    避免 Rich Live 组件因内容超出终端高度而覆盖之前输出的问题。
+    """
+    _CODE_KEYWORDS = ("def ", "import ", "class ", "include", "function ", "const ")
+    # 终端显示兜底：清洗歧义宽度字符（带圈数字→ASCII 编号），即使 LLM 违反
+    # 提示词约束输出此类字符，打字机与 Markdown 渲染也不会出现字符重叠
+    text = _sanitize_ambiguous_width(text)
+    stripped = text.strip()
+
+    # 估算渲染后的行数，超过终端高度 2/3 时跳过打字机效果
+    # Live 组件在固定位置刷新，内容超出终端高度时会覆盖之前的内容，
+    # 导致长文本只显示末尾几行，前面的内容丢失
+    # 注意：必须按终端宽度模拟软换行（cell_len 按显示列宽计算，中文占 2 列）。
+    # 旧实现只数 text.count('\n') + 1，单行长中文段落会被低估为 1-2 行，
+    # 实际经终端 wrap + Markdown 渲染后可达十几行，超出终端高度时
+    # Live 因 vertical_overflow="ellipsis" 只保留末尾，表现为"输出被截断"。
+    text_width = max(10, console.width - 2)  # Live 渲染可用宽度（留边）
+    estimated_lines = sum(
+        max(1, math.ceil(cell_len(line) / text_width))
+        for line in text.split('\n')
+    )
+    # Markdown 渲染（段落空行、标题间距）会进一步增加行数，加 20% 余量
+    estimated_lines = int(estimated_lines * 1.2) + 1
+    max_typewriter_lines = max(10, console.height * 2 // 3)
+    use_typewriter = estimated_lines <= max_typewriter_lines
+
+    def _render_final():
+        """选择最终渲染器，返回 Rich 渲染对象。
+
+        判定顺序（Markdown 优先，防止误判为代码）：
+        1. Markdown 前置特征：```、标题#、列表-、表格| —— 命中即走 Markdown 渲染。
+           Markdown 表格/列表对长内容的处理是 wrap（内容完整），而 Syntax
+           对超宽行是水平裁剪（内容丢失）。含这些特征却走 Syntax 会导致
+           表格行被裁掉后半段，用户看到"内容没显示完整"。
+        2. 代码关键词：def/import/class/include/function/const —— 仅在无
+           Markdown 特征时判定。注意关键词是全文匹配，前端/TS 话题的普通
+           说明文字（如"这个 class 定义"）极易误命中，故只能作为兜底。
+        3. Syntax 渲染必须 word_wrap=True：Rich Syntax 默认不折行，
+           超过终端宽度的行直接水平裁剪，代码/文本内容会丢失。
+        """
+        is_markdown_like = (
+            stripped.startswith("```")
+            or stripped.startswith("#")
+            or stripped.startswith("|")
+            or "- " in stripped[:100]
+            or "* " in stripped[:100]
+        )
+        # Markdown 渲染前保护尖括号标签：Rich Markdown 会静默丢弃 raw HTML
+        # token（如 <done>、<bash>），用户看到内容被"神秘代码"截断（408 现场）
+        if is_markdown_like:
+            return Markdown(_protect_angle_tags_for_markdown(text))
+        elif any(kw in text for kw in _CODE_KEYWORDS):
+            return Syntax(text, "python", theme="monokai", line_numbers=False, word_wrap=True)
+        else:
+            return Markdown(_protect_angle_tags_for_markdown(text))
+
+    if use_typewriter:
+        buffer = ""
+        with Live(console=console, refresh_per_second=60) as live:
+            # 阶段1：逐字累积，Live 原地刷新纯文本
+            # 用 Text 对象包裹 buffer，避免 Rich 将原始文本中的 [/] 等字符误解析为 markup 标签
+            for char in text:
+                buffer += char
+                live.update(Text(buffer))
+                if delay:
+                    time.sleep(delay)
+
+            # 阶段2：最终渲染（循环结束后执行一次）
+            live.update(_render_final())
+    else:
+        # 长文本：直接用 console.print 输出，避免 Live 组件覆盖问题
+        console.print(_render_final())
+
+    # 追加到 HTML 缓冲区（Markdown 文本 + 时间戳）
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _append_html(f'<div style="margin:12px 0;">'
+                 f'<span style="color:#4ade80;">🤖 WDClaude</span> '
+                 f'<span>{html_escape(ts)}</span>'
+                 f'<pre style="background:#2D2D3F; border-radius:4px; padding:12px; '
+                 f'color:#e2e8f0; white-space:pre-wrap; font-family:inherit; margin-top:4px;">'
+                 f'{html_escape(text)}'
+                 f'</pre></div>')
+
+
+def show_history(messages):
+    """显示对话历史"""
+    if not messages:
+        print_info("No conversation history yet.")
+        return
+
+    table = Table(title="Conversation History", show_header=True)
+    table.add_column("ID", style="bright_cyan", width=4)
+    table.add_column("Role", style="bright_cyan")
+    table.add_column("Preview", style="white")
+    table.add_column("Time", style="white")
+
+    for i, msg in enumerate(messages, 1):
+        preview = msg['content'][:50] + "..." if len(msg['content']) > 50 else msg['content']
+        preview = preview.replace('\n', ' ')
+        preview = escape(preview)
+        table.add_row(
+            str(i),
+            msg['role'].capitalize(),
+            preview,
+            datetime.now().strftime("%H:%M")
+        )
+
+    console.print(table)
+
+
+def show_token_count(token_stats: dict):
+    """显示详细的 Token 统计（基于 API 返回的精确 usage）"""
+    console.print()
+    console.print(f"[bold bright_cyan]📊 Token 统计（{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}）[/bold bright_cyan]")
+
+    stats_table = Table(show_header=False, box=None)
+    stats_table.add_column("Metric", style="bright_cyan", min_width=20)
+    stats_table.add_column("Value", style="bright_green", min_width=12)
+
+    stats_table.add_row("输入（命中缓存）", f"{token_stats['prompt_cache_hit']:,}")
+    stats_table.add_row("输入（未命中缓存）", f"{token_stats['prompt_cache_miss']:,}")
+    stats_table.add_row("输出", f"{token_stats['completion_tokens']:,}")
+    stats_table.add_row("总计", f"[bold]{token_stats['total']:,}[/bold]")
+
+    console.print(stats_table)
+    # HTML 缓冲区
+    _append_html(
+        f'<p style="color:#22d3ee;">📊 Token（精确）: '
+        f'输入(缓存命中)={token_stats["prompt_cache_hit"]:,}, '
+        f'输入(未命中)={token_stats["prompt_cache_miss"]:,}, '
+        f'输出={token_stats["completion_tokens"]:,}, '
+        f'总计={token_stats["total"]:,}</p>'
+    )
+
+
+def print_command_list(registry, prefix: str = None) -> None:
+    """打印已注册的斜杠命令列表
+
+    Args:
+        registry: 命令注册表
+        prefix: 可选前缀筛选，如 "/opsx" 只显示 opsx 相关命令。
+                为 None 时显示全部已注册命令。
+    """
+    commands = registry.list_commands()
+    if prefix:
+        commands = [c for c in commands if c.command_name.startswith(prefix)]
+
+    if not commands:
+        print_info("当前没有已注册的斜杠命令。")
+        return
+
+    title = f"{prefix.strip('/').upper()} 命令列表" if prefix else "已注册命令列表"
+    table = Table(title=title, show_header=True, border_style="bright_cyan")
+    table.add_column("命令", style="bright_cyan", min_width=20)
+    table.add_column("用途", style="white")
+
+    for cmd in commands:
+        table.add_row(cmd.command_name, cmd.description or "(无描述)")
+
+    console.print(table)
+    _append_html(f'<p style="color:#22d3ee;">✅ {html_escape(title)} 已显示</p>')
+
+
+def print_command_invoked(command_name: str, user_arg: str, file_path: str = "") -> None:
+    """打印斜杠命令调用提示"""
+    console.print(f"\n[bold bright_cyan]⚡ 命令: {escape(command_name)}[/bold bright_cyan]")
+    if user_arg:
+        console.print(f"📝 参数: {escape(user_arg)}")
+    if file_path:
+        console.print(f"📋 指令来源: {escape(file_path)}")
+    console.print(f"{'─' * 40}\n")
+
+    _append_html(
+        f'<div style="margin:8px 0; padding:8px; border-left:3px solid #22d3ee;">'
+        f'<span style="color:#22d3ee;">⚡ 命令: {html_escape(command_name)}</span><br>'
+        f'{"📝 参数: " + html_escape(user_arg) + "<br>" if user_arg else ""}'
+        f'{"📋 指令来源: " + html_escape(file_path) + "<br>" if file_path else ""}'
+        f'</div>'
+    )
+
+
+def print_command_unknown(command_name: str, available: list[str]) -> None:
+    """打印未知斜杠命令提示"""
+    console.print(f"\n[bold red]⚠ 未知命令: {escape(command_name)}[/bold red]")
+    if available:
+        console.print(f"可用命令: {', '.join(available)}")
+    console.print()
+
+    _append_html(
+        f'<p style="color:#ef4444;">⚠ 未知命令: {html_escape(command_name)}</p>'
+        f'<p>可用命令: {html_escape(", ".join(available))}</p>'
+    )
+
+
+def print_unknown_cmd(command):
+    print_error(f"Unknown command: {command}")
+    console.print("Type /help for available commands")
+
+
+def typewriter_then_collapse(text: str, turn: int, delay: float = 0.003):
+    """
+    打字机效果逐字显示推理过程，完成后折叠为 1-2 行预览。
+    打字阶段限制 Panel 高度（最多终端可见行数），避免内容超屏时 Rich Live 无法渲染。
+    不阻塞主流程，折叠后立即继续执行。
+    用户可通过输入 /t 命令展开/折叠完整思考内容。
+
+    Args:
+        text: 推理过程文本
+        turn: 当前对话轮次号（由 query_loop 传入，与真实轮次一致）
+        delay: 字符间延迟（秒）
+    """
+    # 转义 Rich markup 特殊字符（如方括号），避免解析错误；
+    # 先清洗歧义宽度字符（带圈数字→ASCII 编号），防止 Windows 终端显示重叠
+    text = escape(_sanitize_ambiguous_width(text))
+
+    set_reasoning_text(text, turn)  # 保存文本供展开/折叠命令使用
+    char_count = len(text)
+    preview_lines = 2
+
+    base_title = "💭 思考过程"
+    # 预留标题、边框、折叠提示等占用的行数，取终端高度的 2/3 作为打字阶段最大行数
+    max_visible_lines = max(4, (console.height * 2) // 3 - 4)
+
+    with Live(
+        Panel("", title=base_title, border_style="bright_cyan", padding=(0, 1)),
+        console=console,
+        refresh_per_second=30,
+        transient=False,
+        vertical_overflow="ellipsis"
+    ) as live:
+        # 阶段1：打字机 —— 只显示最后 max_visible_lines 行，确保 Panel 不超出终端高度
+        accumulated = ""
+        for _, char in enumerate(text):
+            accumulated += char
+            # 截取最后 N 行，保持 Live 渲染高度可控
+            all_lines = accumulated.split('\n')
+            visible_lines = all_lines[-max_visible_lines:]
+            display_text = '\n'.join(visible_lines)
+            live.update(
+                Panel(display_text, title=base_title, border_style="bright_cyan", padding=(0, 1)),
+                refresh=True
+            )
+            if delay:
+                time.sleep(delay)
+
+        # 阶段2：打字完成后，折叠为 1-2 行预览
+        lines = text.split('\n')
+        preview = '\n'.join(lines[:preview_lines])
+        if len(lines) > preview_lines or len(preview) < char_count:
+            preview += "\n···"
+
+        collapsed_panel = Panel(
+            preview + f"\n[已折叠，共 {char_count} 字符] — 输入 /t 数字 展开",
+            title=f"💭 思考过程 ({char_count} 字符) [已折叠]",
+            border_style="bright_cyan",
+            padding=(0, 1)
+        )
+        live.update(collapsed_panel, refresh=True)
+
+    # 不阻塞，直接继续。完整文本由 QueryLoop 存储，通过 /t 命令访问。
+    # 追加完整推理过程到 HTML 缓冲区
+    _append_html(f'<details style="margin:8px 0;">'
+                 f'<summary style="cursor:pointer;">💭 思考过程 ({char_count} 字符)</summary>'
+                 f'<pre style="background:#2D2D3F; border-radius:4px; padding:12px; '
+                 f'color:#e2e8f0; white-space:pre-wrap; font-family:inherit; margin-top:8px;">'
+                 f'{html_escape(text)}'
+                 f'</pre></details>')
+
+
+def print_tool_call(tool_name: str, params: dict):
+    """打印工具调用预告，根据工具类型显示关键参数"""
+    if tool_name == "bash":
+        detail = params.get("command", "")
+    elif tool_name == "done":
+        detail = ""
+    elif tool_name == "file_view":
+        # file_view 额外显示 limit 和 offset 参数
+        path = params.get("path", "")
+        limit = params.get("limit")
+        offset = params.get("offset")
+        parts = [path]
+        if limit is not None:
+            parts.append(f"limit={limit}")
+        if offset is not None:
+            parts.append(f"offset={offset}")
+        detail = "，".join(parts)
+    elif tool_name == "web_search":
+        # web_search 显示查询词与请求条数
+        query = params.get("query", "")
+        max_results = params.get("max_results")
+        detail = f"{query}（max_results={max_results}）" if max_results is not None else query
+    else:
+        detail = params.get("path", "")
+
+    # 箭头用亮青色（与工具名一致），工具名亮青加粗，参数亮白
+    # detail 来自 LLM 输出的 bash 命令/路径等，可能含 [INFO]、[bash] 等方括号
+    # 文本，必须 escape，否则 MarkupError 崩溃
+    console.print(f"  [bold bright_cyan]→[/bold bright_cyan] [bold bright_cyan]{escape(tool_name)}[/bold bright_cyan] [white]{escape(detail)}[/white]")
+    # HTML 缓冲区
+    _append_html(f'<p style="margin:4px 0 4px 20px; color:#22d3ee;">→ {html_escape(tool_name)} {html_escape(detail)}</p>')
+
+
+def print_ask_user_question(question: str, choices: list[str] | None = None) -> str:
+    """
+    在终端渲染 LLM 的提问并等待用户输入。
+
+    Args:
+        question: 问题文本
+        choices: 可选预设选项列表
+
+    Returns:
+        str: 用户输入的回答文本
+    """
+    # 构建问题内容（清洗歧义宽度字符，防止终端显示重叠）
+    content_lines = [_sanitize_ambiguous_width(question)]
+    if choices:
+        content_lines.append("")
+        for i, choice in enumerate(choices, 1):
+            content_lines.append(f"  [{i}] {choice}")
+        content_lines.append("")
+        content_lines.append("请输入编号选择，或直接输入文本回答：")
+
+    content = "\n".join(content_lines)
+
+    # 使用 Rich Panel 渲染问题，边框亮青色
+    # content 含 "[1] 选项" 编号及 LLM 生成的任意文本，必须用 Text 对象
+    # 禁止 markup 解析，否则 [1] 会被当作样式标签抛 MarkupError
+    console.print(Panel(
+        Text(content),
+        title="🤔 AI 提问",
+        border_style="bright_cyan",
+        padding=(1, 2),
+        width=console.width - 2
+    ))
+
+    # 追加到 HTML 缓冲区
+    choices_html = ""
+    if choices:
+        choices_html = '<div style="margin-top:8px;">'
+        for i, choice in enumerate(choices, 1):
+            choices_html += f'<div>[{i}] {html_escape(choice)}</div>'
+        choices_html += '<div style="margin-top:4px;">请输入编号选择，或直接输入文本回答</div></div>'
+
+    _append_html(
+        f'<div style="margin:12px 0; border:1px solid #22d3ee; border-radius:4px; padding:12px;">'
+        f'<div style="color:#22d3ee; font-weight:bold; margin-bottom:8px;">🤔 AI 提问</div>'
+        f'<div style="color:#e2e8f0;">{html_escape(question)}</div>'
+        f'{choices_html}'
+        f'</div>'
+    )
+
+    # 同步阻塞等待用户输入（与项目全同步架构一致）
+    user_input = Prompt.ask("\n[bold bright_cyan]>[/bold bright_cyan]")
+    return user_input
+
+
+def print_tool_result(tool_name: str, content: str, params: dict | None = None):
+    """打印工具执行结果。
+
+    Args:
+        tool_name: 工具名称
+        content: 工具执行返回的内容
+        params: 工具参数（可选，用于判断 bash openspec 等命令时抑制长输出）
+    """
+    if not content:
+        console.print("    [bright_cyan]⚠ 无输出[/bright_cyan]")
+        _append_html('<p style="margin:4px 0 4px 40px; color:#22d3ee;">⚠ 无输出</p>')
+        console.print()
+        return
+
+    # 对于 file_view、use_skill、excel_view，不打印详细内容，只输出简洁提示
+    if tool_name in ("file_view", "use_skill", "excel_view"):
+        console.print(f"    [bright_green]✓[/bright_green] [{tool_name}]工具执行结果：详细内容略", markup=True)
+        _append_html(f'<p style="margin:4px 0 4px 40px; color:#4ade80;">✓ [{tool_name}] 工具执行结果</p>')
+        console.print()
+        return
+
+    # 对于 get_file_context，解析摘要和Bug召回数量，简洁显示
+    if tool_name == "get_file_context":
+        import re as _re
+        # 统计召回的 Bug 数量（匹配 "## bug_" 开头的行）
+        bug_count = len(_re.findall(r"^## bug_", content, _re.MULTILINE))
+        if "无相关历史问题" in content or bug_count == 0:
+            bug_hint = "无相关 Bug"
+        else:
+            bug_hint = f"召回 {bug_count} 个相关 Bug"
+        console.print(f"    [bright_green]✓[/bright_green] [get_file_context] 函数摘要已获取，{bug_hint}", markup=True)
+        _append_html(f'<p style="margin:4px 0 4px 40px; color:#4ade80;">✓ [get_file_context] 函数摘要已获取，{bug_hint}</p>')
+        console.print()
+        return
+
+    # 对于 web_search，只打印结果首行（后端/查询/条数摘要），完整结果注入 LLM 上下文
+    # [BLOCKED]/[ERROR] 提示较短，走正常打印路径完整展示
+    if tool_name == "web_search" and not content.startswith(("[BLOCKED]", "[ERROR]")):
+        first_line = content.split("\n", 1)[0]
+        console.print(f"    [bright_green]✓[/bright_green] {escape(first_line)}，详细内容略", markup=True)
+        _append_html(f'<p style="margin:4px 0 4px 40px; color:#4ade80;">✓ {html_escape(first_line)}，详细内容略</p>')
+        console.print()
+        return
+
+    # 对于 bash openspec 命令，只打印简略提示（输出通常很长，且对用户无直接价值）
+    # LLM 仍会收到完整结果，仅 CLI 不打印
+    if tool_name == "bash" and params:
+        cmd_str = params.get("command", "").strip()
+        if cmd_str.startswith("openspec"):
+            console.print(f"    [bright_green]✓[/bright_green] [bash]工具执行结果：略", markup=True)
+            _append_html(f'<p style="margin:4px 0 4px 40px; color:#4ade80;">✓ [bash] 工具执行结果（openspec 命令，已折叠）</p>')
+            console.print()
+            return
+
+    # 其他工具正常打印
+    if len(content) < 300:
+        safe_content = escape(content)
+        console.print(f"    [bright_green]✓[/bright_green] {safe_content}", markup=True)
+        _append_html(f'<p style="margin:4px 0 4px 40px; color:#4ade80;">✓</p>'
+                     f'<pre style="background:#2D2D3F; margin:4px 0 4px 40px; padding:8px; '
+                     f'border-radius:4px; color:#e2e8f0; white-space:pre-wrap; font-family:inherit; '
+                     f'font-size:13px;">{html_escape(content)}</pre>')
+        console.print()
+    else:
+        lines = content.count("\n") + 1
+        console.print(f"    [bright_green]✓[/bright_green] ({lines} 行，共 {len(content)} 字符)", markup=True)
+        safe_content = escape(content)
+        console.print(safe_content, markup=True)
+        _append_html(f'<p style="margin:4px 0 4px 40px; color:#4ade80;">✓'
+                     f' ({lines} 行，{len(content)} 字符)</p>'
+                     f'<pre style="background:#2D2D3F; margin:4px 0 4px 40px; padding:8px; '
+                     f'border-radius:4px; color:#e2e8f0; white-space:pre-wrap; font-family:inherit; '
+                     f'font-size:13px;">{html_escape(content)}</pre>')
+        console.print()
+
+
+# 存储所有轮次的推理过程内容，供展开/折叠命令循环访问
+_reasoning_history = []          # 列表元素: (text, turn_number)
+_reasoning_cursor = -1           # 当前选中的索引，-1 表示最新轮次
+_reasoning_expanded = False
+
+
+_reasoning_turn_counter = 0
+
+
+def set_reasoning_text(text: str, turn: int = None):
+    """保存推理过程文本（由 query_loop 调用）。
+
+    Args:
+        text: 推理过程文本
+        turn: 当前轮次号（由 query_loop 传入真实轮次号）。若为 None 则自动递增（兼容旧调用）。
+    """
+    global _reasoning_history, _reasoning_cursor, _reasoning_turn_counter
+    if turn is None:
+        _reasoning_turn_counter += 1
+        turn = _reasoning_turn_counter
+    else:
+        _reasoning_turn_counter = turn
+    _reasoning_history.append((text, turn))
+    _reasoning_cursor = -1  # 新内容来了，光标回到最新
+
+
+def reset_reasoning():
+    """重置推理历史（新对话开始时调用）。"""
+    global _reasoning_history, _reasoning_cursor, _reasoning_expanded, _reasoning_turn_counter
+    _reasoning_history.clear()
+    _reasoning_cursor = -1
+    _reasoning_expanded = False
+    _reasoning_turn_counter = 0
+
+
+def expand_reasoning(turn: int = -1):
+    """展开指定轮次的思考过程。
+
+    Args:
+        turn: 要展开的轮次号。-1 表示最新轮次；正数表示具体 Turn 编号。
+    """
+    global _reasoning_history, _reasoning_cursor, _reasoning_expanded
+    if not _reasoning_history:
+        console.print("无思考过程可展开")
+        return
+
+    total = len(_reasoning_history)
+
+    if turn == -1:
+        # 展开最新轮次
+        idx = total - 1
+        _reasoning_cursor = -1
+    else:
+        # 查找指定 turn 号对应的记录
+        idx = None
+        for i, (_, t) in enumerate(_reasoning_history):
+            if t == turn:
+                idx = i
+                break
+        if idx is None:
+            available = [str(t) for _, t in _reasoning_history]
+            console.print(f"[dim]未找到 Turn {turn} 的思考过程。有思考内容的轮次为: {', '.join(available)}[/dim]")
+            return
+        _reasoning_cursor = idx
+
+    text, turn_num = _reasoning_history[idx]
+    _reasoning_expanded = True
+    console.print(Panel(
+        text,
+        title=f"💭 思考过程 [Turn {turn_num}] {idx + 1}/{total} ({len(text)} 字符) [已展开]",
+        border_style="bright_cyan",
+        padding=(0, 1)
+    ))
+
+
+def fold_reasoning():
+    """折叠当前展开的思考过程"""
+    global _reasoning_history, _reasoning_cursor, _reasoning_expanded
+    if not _reasoning_history:
+        console.print("无思考过程可折叠")
+        return
+
+    if not _reasoning_expanded:
+        console.print("当前已是折叠状态")
+        return
+
+    total = len(_reasoning_history)
+    if _reasoning_cursor == -1:
+        idx = total - 1
+    else:
+        idx = _reasoning_cursor
+
+    text, turn = _reasoning_history[idx]
+    _show_reasoning_folded(text, turn, total)
+
+
+def _show_reasoning_folded(text: str, turn: int, total: int):
+    """折叠显示推理过程"""
+    global _reasoning_expanded
+    _reasoning_expanded = False
+    lines = text.split('\n')
+    preview = '\n'.join(lines[:2])
+    char_count = len(text)
+    if len(lines) > 2 or len(preview) < char_count:
+        preview += "\n···"
+    console.print(Panel(
+        preview + f"\n[已折叠，共 {char_count} 字符] — 输入 /t 数字 展开",
+        title=f"💭 思考过程 [Turn {turn}] ({char_count} 字符) [已折叠]",
+        border_style="bright_cyan",
+        padding=(0, 1)
+    ))
+
+
+@contextmanager
+def show_status(text: str = "Thinking...", spinner: str = "dots"):
+    """
+    显示状态动画的上下文管理器。
+    用法：
+        with show_status("正在执行..."):
+            do_something()
+    """
+    with console.status(f"[bold bright_green]{text}...", spinner=spinner):
+        yield  # 把控制权交还给调用方
+
+
+def print_todo_list(todo_list):
+    """用 Rich 渲染 todo 列表，显示进度条和各条目状态。
+
+    Args:
+        todo_list: TodoList 对象（来自 src.query.todo_manager）
+    """
+    if todo_list is None or todo_list.is_empty():
+        return
+
+    items = todo_list.items
+    total = len(items)
+    completed = todo_list.completed_count()
+    in_progress = todo_list.current_in_progress()
+
+    # 构建进度条
+    bar_width = 20
+    filled = int(bar_width * completed / total) if total > 0 else 0
+    bar = "█" * filled + "░" * (bar_width - filled)
+    pct = int(completed / total * 100) if total > 0 else 0
+
+    # 构建表格
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column("状态", width=3)
+    table.add_column("任务", style="white")
+
+    for item in items:
+        if item.status.value == "completed":
+            status_icon = "[bright_green]✅[/bright_green]"
+            content_style = "white"
+        elif item.status.value == "in_progress":
+            status_icon = "[bright_cyan]▶[/bright_cyan]"
+            content_style = "bold bright_cyan"
+            # active_form 来自 LLM 输出，可能含方括号文本，必须转义防 MarkupError
+            # （并清洗歧义宽度字符，防止终端重叠）
+            suffix = f" — {escape(_sanitize_ambiguous_width(item.active_form))}" if item.active_form else ""
+        else:
+            status_icon = "[white]○[/white]"
+            content_style = "white"
+            suffix = ""
+
+        # 使用 markup 转义内容中的方括号（并清洗歧义宽度字符）
+        safe_content = escape(_sanitize_ambiguous_width(item.content))
+        if item.status.value == "in_progress":
+            table.add_row(status_icon, f"[{content_style}]{safe_content}[/{content_style}]{suffix}")
+        else:
+            table.add_row(status_icon, f"[{content_style}]{safe_content}[/{content_style}]")
+
+    # 使用 Panel 包裹
+    panel = Panel(
+        table,
+        title=f"[bold bright_cyan]📋 Todo [{bar}] {completed}/{total} ({pct}%)[/bold bright_cyan]",
+        border_style="bright_cyan",
+        padding=(0, 1),
+    )
+
+    console.print(panel)
+
+    # HTML 缓冲区
+    todo_html_lines = []
+    for item in items:
+        if item.status.value == "completed":
+            icon = "✅"
+            color = "#4ade80"
+        elif item.status.value == "in_progress":
+            icon = "▶"
+            color = "#22d3ee"
+        else:
+            icon = "○"
+            color = "#e2e8f0"
+        todo_html_lines.append(
+            f'<div style="color:{color};">{icon} {html_escape(item.content)}</div>'
+        )
+    _append_html(
+        f'<div style="margin:12px 0; border:1px solid #22d3ee; border-radius:4px; padding:12px;">'
+        f'<div style="color:#22d3ee; font-weight:bold; margin-bottom:8px;">📋 Todo [{bar}] {completed}/{total} ({pct}%)</div>'
+        f'{"".join(todo_html_lines)}'
+        f'</div>'
+    )
+
+
+def print_memory_recall(retrieval_result):
+    """打印日常交流的记忆召回结果（简洁格式，仅显示策略和最终结果）。
+
+    Args:
+        retrieval_result: RetrievalResult 对象
+    """
+    if retrieval_result is None:
+        return
+
+    strategy = getattr(retrieval_result, "strategy", "unknown")
+    strategy_desc = getattr(retrieval_result, "strategy_desc", "")
+    final_items = getattr(retrieval_result, "final_items", [])
+    final_count = getattr(retrieval_result, "final_count", 0)
+
+    if final_count == 0:
+        console.print(f"  🧠 记忆召回: 无相关记忆 (策略: {strategy_desc})")
+        console.print()
+        _append_html(f'<p>🧠 记忆召回: 无相关记忆 (策略: {html_escape(strategy_desc)})</p>')
+        return
+
+    # 简洁格式：仅打印策略行，不打印具体记忆条目
+    console.print(f"  🧠 记忆召回 策略: {strategy_desc} ({strategy}) | 召回: {final_count} 条")
+    console.print()
+
+    _append_html(
+        f'<div style="margin:8px 0; padding:8px; border-left:3px solid #22d3ee;">'
+        f'<div style="color:#22d3ee; font-weight:bold;">🧠 记忆召回 策略: {html_escape(strategy_desc)} ({html_escape(strategy)}) | 召回: {final_count} 条</div>'
+        f'</div>'
+    )
+
+
+def print_memory_recall_detailed(retrieval_result, query: str = ""):
+    """打印 /mem rt 命令的记忆召回完整过程（含所有阶段）。
+
+    Args:
+        retrieval_result: RetrievalResult 对象
+        query: 查询文本（可选，用于显示）
+    """
+    if retrieval_result is None:
+        console.print("[yellow]无召回结果[/yellow]")
+        return
+
+    strategy = getattr(retrieval_result, "strategy", "unknown")
+    strategy_desc = getattr(retrieval_result, "strategy_desc", "")
+    stages = getattr(retrieval_result, "stages", [])
+    final_items = getattr(retrieval_result, "final_items", [])
+    final_count = getattr(retrieval_result, "final_count", 0)
+
+    # 头部
+    sep = "=" * 50
+    console.print(f"\n[bold bright_cyan]{sep}[/bold bright_cyan]")
+    console.print(f"  [bold white]记忆召回测试[/bold white]")
+    console.print(f"  [bold white]策略: {strategy_desc} ({strategy})[/bold white]")
+    if query:
+        console.print(f"  [white]查询: \"{escape(query)}\"[/white]")
+    console.print(f"[bold bright_cyan]{sep}[/bold bright_cyan]")
+
+    # 各阶段
+    for i, stage in enumerate(stages, 1):
+        stage_name = getattr(stage, "stage_name", "")
+        stage_items = getattr(stage, "items", [])
+        stage_count = getattr(stage, "count", 0)
+
+        console.print(f"\n  [bold white]── [{i}] {stage_name} ({stage_count}条) ──[/bold white]")
+        for j, item in enumerate(stage_items, 1):
+            score = item.get("score", "N/A")
+            content = item.get("content", "")
+            entry_id = item.get("id", "")
+            session_id = item.get("session_id", "")
+            if isinstance(score, float):
+                score_str = f"{score:.4f}"
+            else:
+                score_str = str(score)
+            console.print(f"  [white]\\[{j}] 分数: {score_str}[/white]")
+            if entry_id:
+                console.print(f"  [white](id={escape(entry_id)})[/white]")
+            console.print(f"  [white]- {escape(content)}[/white]")
+            if session_id:
+                console.print(f"  [white](session={escape(session_id)})[/white]")
+            console.print()
+
+    # 最终返回
+    console.print(f"\n  [bold bright_green]── 最终返回 ({final_count}条) ──[/bold bright_green]")
+    for j, item in enumerate(final_items, 1):
+        score = item.get("score", "N/A")
+        content = item.get("content", "")
+        entry_id = item.get("id", "")
+        session_id = item.get("session_id", "")
+        if isinstance(score, float):
+            score_str = f"{score:.4f}"
+        else:
+            score_str = str(score)
+        console.print(f"  [white]\\[{j}] 分数: {score_str}[/white]")
+        if entry_id:
+            console.print(f"  [white](id={escape(entry_id)})[/white]")
+        console.print(f"  [white]- {escape(content)}[/white]")
+        if session_id:
+            console.print(f"  [white](session={escape(session_id)})[/white]")
+        console.print()
+
+    console.print(f"[bold bright_cyan]{sep}[/bold bright_cyan]\n")
+
+    # HTML 缓冲区
+    html_parts = [f'<div style="margin:12px 0; border:1px solid #22d3ee; border-radius:8px; padding:12px;">']
+    html_parts.append(f'<div style="color:#22d3ee; font-weight:bold; margin-bottom:8px;">记忆召回测试</div>')
+    html_parts.append(f'<div>策略: {html_escape(strategy_desc)} ({html_escape(strategy)})</div>')
+    if query:
+        html_parts.append(f'<div>查询: "{html_escape(query)}"</div>')
+    html_parts.append('<hr style="border:none; border-top:1px solid #e0e0e0; margin:8px 0;">')
+
+    for i, stage in enumerate(stages, 1):
+        stage_name = getattr(stage, "stage_name", "")
+        stage_items = getattr(stage, "items", [])
+        stage_count = getattr(stage, "count", 0)
+        html_parts.append(f'<div style="color:#22d3ee; font-weight:bold; margin-top:8px;">── [{i}] {html_escape(stage_name)} ({stage_count}条) ──</div>')
+        for j, item in enumerate(stage_items, 1):
+            score = item.get("score", "N/A")
+            content = item.get("content", "")
+            entry_id = item.get("id", "")
+            session_id = item.get("session_id", "")
+            score_str = f"{score:.4f}" if isinstance(score, float) else str(score)
+            html_parts.append(f'<div style="margin:4px 0 4px 16px;">[{j}] 分数: {score_str}</div>')
+            if entry_id:
+                html_parts.append(f'<div style="margin:0 0 0 16px;">(id={html_escape(entry_id)})</div>')
+            html_parts.append(f'<div style="margin:0 0 4px 16px;">- {html_escape(content)}</div>')
+            if session_id:
+                html_parts.append(f'<div style="margin:0 0 4px 16px;">(session={html_escape(session_id)})</div>')
+
+    html_parts.append(f'<div style="color:#4ade80; font-weight:bold; margin-top:8px;">── 最终返回 ({final_count}条) ──</div>')
+    for j, item in enumerate(final_items, 1):
+        score = item.get("score", "N/A")
+        content = item.get("content", "")
+        entry_id = item.get("id", "")
+        session_id = item.get("session_id", "")
+        score_str = f"{score:.4f}" if isinstance(score, float) else str(score)
+        html_parts.append(f'<div style="margin:4px 0 4px 16px;">[{j}] 分数: {score_str}</div>')
+        if entry_id:
+            html_parts.append(f'<div style="margin:0 0 0 16px;">(id={html_escape(entry_id)})</div>')
+        html_parts.append(f'<div style="margin:0 0 4px 16px;">- {html_escape(content)}</div>')
+        if session_id:
+            html_parts.append(f'<div style="margin:0 0 4px 16px;">(session={html_escape(session_id)})</div>')
+
+    html_parts.append('</div>')
+    _append_html(''.join(html_parts))
+
+
+def get_input() -> str:
+    """获取用户输入
+
+    使用 Python 内置 input() 读取用户输入。
+
+    关键修复（三重保障），解决长输入时文字覆盖 bug：
+
+    1. 输出模式确保 PROCESSED(0x1) | WRAP(0x2) | VT(0x4) 全部开启：
+       不再仅 OR 入 0x2，而是确保 0x1/0x2/0x4 三个标志同时存在。
+       Rich Console 在输出时可能清除 WRAP 和 PROCESSED 标志：
+       - WRAP(0x2) 缺失 → 光标到行尾不换行，回到行首覆盖已有内容
+       - PROCESSED(0x1) 缺失 → \\n 不做 CRLF 转换，光标下移但不回到列 0
+
+    2. 输入模式禁用 VT_INPUT(0x200)，确保 LINE_INPUT(0x2) | ECHO_INPUT(0x4)：
+       VT 输入模式下控制台不负责行编辑和自动换行，是长输入覆盖的另一个诱因。
+       Rich 或系统可能启用了 VT_INPUT，需在每次 input() 前显式禁用。
+
+    3. 使用 \\r\\n 替代 \\n：
+       VT 模式下 \\n 仅做 LF（光标下移同列），\\r 才做 CR（回到列 0）。
+       \\r\\n 确保光标回到行首再换行，避免提示符起始列偏移。
+    """
+    import sys
+
+    try:
+        if os.name == 'nt':
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            stdout_handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            stdin_handle = kernel32.GetStdHandle(-10)   # STD_INPUT_HANDLE
+
+            # 保存原始模式（input() 结束后恢复，避免影响其他组件）
+            out_mode_orig = ctypes.c_ulong()
+            in_mode_orig = ctypes.c_ulong()
+            has_out_mode = kernel32.GetConsoleMode(stdout_handle, ctypes.byref(out_mode_orig))
+            has_in_mode = kernel32.GetConsoleMode(stdin_handle, ctypes.byref(in_mode_orig))
+
+            # 0. 复位 VT 状态机（兜底保障）：
+            #    子进程（npm/git/node 等）输出中的 \x1b[?7l 会关闭终端自动换行、
+            #    \x1b[?25l 隐藏光标、\x1b[t;br 修改滚动区域。在 ConPTY /
+            #    Windows Terminal 下，这些状态由终端自身解释并保留，
+            #    SetConsoleMode 恢复 mode 位管不到，必须在 VT 启用状态下
+            #    显式发送复位序列：
+            #      \x1b[?7h  DECAWM on（恢复行尾自动换行）
+            #      \x1b[?25h 显示光标（部分程序隐藏光标后不恢复）
+            #      \x1b[r    滚动区域复位为全屏
+            #    ⚠ 关键：\x1b[r（DECSTBM）按 xterm 规范执行后光标会跳到
+            #    HOME（屏幕左上角）！裸发会把提示符写到视口顶部，覆盖启动
+            #    横幅等已有内容。必须用 DECSC(7)/DECRC(8) 保存/恢复光标位置
+            #    包裹，保证净效果为"只复位滚动区域、不移动光标"：
+            #      \x1b7    保存当前光标位置
+            #      \x1b8    恢复光标位置（在 \x1b[r 之后发送）
+            if has_out_mode:
+                kernel32.SetConsoleMode(stdout_handle, out_mode_orig.value | 0x7)
+                sys.stdout.write("\x1b7\x1b[?7h\x1b[?25h\x1b[r\x1b8")
+                sys.stdout.flush()
+
+            # 1. 输出模式：禁用 VT(0x4)，仅保留 PROCESSED(0x1) | WRAP(0x2)
+            #    Rich 的 Live/status 等组件在 VT 模式下会修改终端状态（DECAWM
+            #    自动换行、DECSTBM 滚动区域），退出后可能未完全重置。input()
+            #    的逐字符回显依赖这些状态，一旦被篡改就导致光标到行尾时不换行
+            #    而是回到行首覆盖已有内容。禁用 VT 处理可彻底回避此问题。
+            #    粘贴（paste）不受影响是因为控制台对粘贴做批量写入，绕过逐字符回显。
+            if has_out_mode:
+                kernel32.SetConsoleMode(stdout_handle, (out_mode_orig.value | 0x3) & ~0x4)
+
+            # 2. 输入模式：禁用 VT_INPUT(0x200)，确保 LINE_INPUT(0x2) | ECHO_INPUT(0x4)
+            if has_in_mode:
+                kernel32.SetConsoleMode(stdin_handle, (in_mode_orig.value & ~0x200) | 0x6)
+
+            try:
+                # 3. 读取当前文本属性，用于着色
+                info = _CONSOLE_SCREEN_BUFFER_INFO()
+                kernel32.GetConsoleScreenBufferInfo(stdout_handle, ctypes.byref(info))
+                original_attr = info.wAttributes
+
+                # 4. 写入提示符：\r\n 确保光标回到行首再换行
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                kernel32.SetConsoleTextAttribute(stdout_handle, 0xA)  # bright green
+                sys.stdout.write("➤ You : ")
+                sys.stdout.flush()
+                kernel32.SetConsoleTextAttribute(stdout_handle, original_attr)
+
+                # 5. 读取用户输入
+                user_input = input()
+            finally:
+                # 恢复原始模式，避免影响 Rich Console 后续输出
+                try:
+                    if has_out_mode:
+                        kernel32.SetConsoleMode(stdout_handle, out_mode_orig.value)
+                    if has_in_mode:
+                        kernel32.SetConsoleMode(stdin_handle, in_mode_orig.value)
+                except Exception:
+                    pass
+
+            return user_input.strip()
+        else:
+            # 非 Windows: 安全使用 ANSI 转义码
+            sys.stdout.write("\n\033[1;33m➤ You :\033[0m ")
+            sys.stdout.flush()
+            user_input = input()
+            return user_input.strip()
+    except (KeyboardInterrupt, EOFError):
+        return "/quit"
+
