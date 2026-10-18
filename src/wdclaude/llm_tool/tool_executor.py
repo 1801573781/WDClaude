@@ -12,14 +12,14 @@ logger = logging.getLogger(__name__)
 # ======================== XML 标签集中管理 ========================
 # 所有 XML 工具标签（用于标签泄露清理和识别）。
 # 新增工具时必须同步更新这三个常量，其他地方全部引用它们。
-_ALL_XML_TAGS = {"create", "str_replace", "bash", "done", "todowrite", "file_view", "excel_view", "use_skill", "old", "new", "AskUserQuestion", "get_file_context", "web_search"}
+_ALL_XML_TAGS = {"create", "str_replace", "bash", "done", "todowrite", "file_view", "excel_view", "use_skill", "old", "new", "AskUserQuestion", "get_file_context", "web_search", "web_fetch", "view_image"}
 
 # 容器标签（需要闭合标签的，如 <create>...</create>）
 # 修复：todowrite 此前遗漏，导致其开标签正则虽已定义但 strict 循环永远遍历不到，标签永不解析
 _CONTAINER_TAGS = {"create", "str_replace", "bash", "done", "todowrite"}
 
 # 自闭合标签（如 <file_view path="..."/>）
-_SELF_CLOSING_TAGS = {"file_view", "excel_view", "use_skill", "AskUserQuestion", "get_file_context", "web_search"}
+_SELF_CLOSING_TAGS = {"file_view", "excel_view", "use_skill", "AskUserQuestion", "get_file_context", "web_search", "web_fetch", "view_image"}
 
 # 属性序列片段（strict，双引号值）：任意属性名 + 双引号值（值内可含 > / 等特殊字符），重复 1+ 次。
 # 用于属性顺序无关的标签匹配：LLM 交换属性顺序（如 max_results 写在 query 之前）时不再失配。
@@ -397,6 +397,11 @@ def _parse_tools_lenient(response: str):
                 if mr and str(mr).isdigit():
                     params["max_results"] = int(mr)
                 tools.append({"llm_tool": "web_search", "params": params})
+            elif tag == "web_fetch":
+                u = _pick("url")
+                if not u:
+                    continue
+                tools.append({"llm_tool": "web_fetch", "params": {"url": u}})
             elif tag == "file_view":
                 p = _pick("path")
                 if not p:
@@ -441,6 +446,16 @@ def _parse_tools_lenient(response: str):
                 if choices:
                     params["choices"] = [c.strip() for c in choices.split(",") if c.strip()]
                 tools.append({"llm_tool": "AskUserQuestion", "params": params})
+            elif tag == "view_image":
+                p = _pick("path")
+                if not p:
+                    continue
+                params = {"path": p}
+                for k in ("region", "focus"):
+                    v = _pick(k)
+                    if v:
+                        params[k] = v
+                tools.append({"llm_tool": "view_image", "params": params})
 
             consumed.append(m.span())
 
@@ -726,6 +741,8 @@ def _parse_tools_strict(response: str):
         "get_file_context": re.compile(r'<get_file_context\s+(' + _ATTR_SEQ + r')/>'),
         "AskUserQuestion": re.compile(r'<AskUserQuestion\s+(' + _ATTR_SEQ + r')/?>'),
         "web_search": re.compile(r'<web_search\s+(' + _ATTR_SEQ + r')/?>'),
+        "web_fetch": re.compile(r'<web_fetch\s+(' + _ATTR_SEQ + r')/?>'),
+        "view_image": re.compile(r'<view_image\s+(' + _ATTR_SEQ + r')/?>'),
     }
     for tool_name, pattern in non_container_patterns.items():
         for m in pattern.finditer(response):
@@ -944,6 +961,21 @@ def _build_result(response: str, all_matches: list, _is_inside_container):
                 params["max_results"] = int(mr.group(1))
             tools.append({"llm_tool": "web_search", "params": params})
 
+        elif tool_name == "web_fetch":
+            attrs = m.group(1)
+            tools.append({"llm_tool": "web_fetch",
+                          "params": {"url": _extract_attr(attrs, "url") or ""}})
+
+        elif tool_name == "view_image":
+            # 视觉重看工具（multimodal_spec 6.2）：path 必填，region/focus 可选
+            attrs = m.group(1)
+            params = {"path": _extract_attr(attrs, "path") or ""}
+            for k in ("region", "focus"):
+                v = _extract_attr(attrs, k)
+                if v:
+                    params[k] = v
+            tools.append({"llm_tool": "view_image", "params": params})
+
         last_end = end
 
     if last_end < len(response):
@@ -1049,6 +1081,22 @@ def _parse_tools_loose(text: str):
             params["max_results"] = int(mr.group(1))
         tools.append({"llm_tool": "web_search", "params": params})
 
+    # 5.6.1 web_fetch（单/双引号，属性顺序无关）
+    for m in _iter_outside_code(r"<web_fetch\s+(" + _ATTR_SEQ_LOOSE + r")/?>", text):
+        attrs = m.group(1)
+        tools.append({"llm_tool": "web_fetch",
+                      "params": {"url": _extract_attr_loose(attrs, "url") or ""}})
+
+    # 5.7 view_image（单/双引号，属性顺序无关，multimodal_spec 6.2）
+    for m in _iter_outside_code(r"<view_image\s+(" + _ATTR_SEQ_LOOSE + r")/?>", text):
+        attrs = m.group(1)
+        params = {"path": _extract_attr_loose(attrs, "path") or ""}
+        for k in ("region", "focus"):
+            v = _extract_attr_loose(attrs, k)
+            if v:
+                params[k] = v
+        tools.append({"llm_tool": "view_image", "params": params})
+
     # 6. str_replace 容器（单/双引号，属性顺序无关）
     for m in _iter_outside_code(
         r"<str_replace\s+(" + _ATTR_SEQ_LOOSE + r")>(.*?)</str_replace>",
@@ -1084,6 +1132,36 @@ def _parse_tools_loose(text: str):
 
 code_output_root = global_cfg.base_path.code_output_root
 spec_root = global_cfg.base_path.spec_root
+
+# 媒体扩展名守卫默认清单（config media.handlers 不可用时兜底，F3）
+_DEFAULT_MEDIA_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+
+
+def _media_extensions() -> set:
+    """从配置收集已启用媒体的扩展名（小写、含点号）。
+
+    配置缺失或解析异常时回退到默认图像扩展名清单——无论视觉链路是否可用，
+    file_view 都不应把二进制媒体文件当文本读进上下文。
+    """
+    exts = set()
+    try:
+        media_cfg = getattr(global_cfg, "media", None)
+        handlers = getattr(media_cfg, "handlers", None)
+        if handlers is not None:
+            if isinstance(handlers, dict):
+                handler_items = handlers.values()
+            else:
+                handler_items = vars(handlers).values()
+            for handler in handler_items:
+                if not getattr(handler, "enabled", False):
+                    continue
+                for e in getattr(handler, "extensions", None) or []:
+                    e = str(e).strip().lower()
+                    if e:
+                        exts.add(e if e.startswith(".") else "." + e)
+    except Exception as e:
+        logger.warning(f"媒体扩展名配置解析失败，使用默认清单: {e}")
+    return exts or set(_DEFAULT_MEDIA_EXTS)
 
 # 删除类命令关键字（project_root 沙箱守卫用）
 _BASH_DELETE_CMD_RE = re.compile(
@@ -1296,6 +1374,34 @@ def _guard_bash_delete(command: str) -> tuple[str | None, str]:
     return None, ""
 
 
+# ===== web_search / web_fetch display 双通道接线（spec 10.2，Q1）=====
+# display 渲染回调由 CLI 层注册（mycli 启动时调用 set_web_display_callback），
+# 引擎不直接 import cli_print，保持架构契约。回调签名：fn(display: dict)
+_web_display_callback = None
+
+
+def set_web_display_callback(fn):
+    """注册 web_search / web_fetch 的 display 渲染回调（Rich 面板渲染函数）。"""
+    global _web_display_callback
+    _web_display_callback = fn
+
+
+def is_web_display_registered() -> bool:
+    """display 渲染回调是否已注册（CLI 未注册时 print_tool_result 回退首行摘要）。"""
+    return _web_display_callback is not None
+
+
+def _dispatch_web_display(display: dict):
+    """将 display 结构交给已注册的渲染回调；回调失败不影响工具结果注入。"""
+    if not isinstance(display, dict):
+        return
+    try:
+        if _web_display_callback is not None:
+            _web_display_callback(display)
+    except Exception as e:
+        logger.warning(f"web display 渲染回调失败: {e}")
+
+
 def execute_code_tool(tool):
     """
     执行工具列表，返回 API 消息格式（供下一轮对话使用）。
@@ -1313,9 +1419,18 @@ def execute_code_tool(tool):
     if name == "file_view":
         # file_view 内部已经做了 _is_invalid_path 检测，这里再做一层目录截断和大文件截断
         raw_path = p.get("path", "")
-        result = file_view(spec_root, raw_path,
-                           limit=p.get("limit"),
-                           offset=p.get("offset"))
+        # ===== 媒体扩展名守卫（PNG 读取事故 RC4）：图片等媒体文件禁止当文本读取 =====
+        _ext = Path(raw_path).suffix.lower()
+        if _ext and _ext in _media_extensions():
+            result = (
+                f"[BLOCKED] {raw_path} 是媒体文件（扩展名 {_ext}），file_view 只能读取文本文件，"
+                f"直接读取只会得到二进制乱码。请改用视觉工具阅读图片内容："
+                f'<view_image path="{raw_path}"/>'
+            )
+        else:
+            result = file_view(spec_root, raw_path,
+                               limit=p.get("limit"),
+                               offset=p.get("offset"))
         # 如果返回的是目录列表且行数过多，截断并附加警告，防止 LLM 因巨量上下文产生幻觉
         if result and not result.startswith("错误") and not result.startswith("[BLOCKED]") and not result.startswith(
                 "[ERROR]"):
@@ -1453,9 +1568,19 @@ def execute_code_tool(tool):
             if guard_note:
                 result = f"{result}\n{guard_note}"
 
-    elif name == "web_search":
-        from wdclaude.tools.web_search import execute_web_search
-        result = execute_web_search(p)
+    elif name == "view_image":
+        # 视觉重看/特写工具（multimodal_spec 6.2/6.3/7 章）：双模式路由 + 熔断
+        # 已返回标准 dict（role=user）直接透传；VisionFatalError 向上冒泡
+        # （D8 fail-fast），由 query_loop 终止本轮，不降级为普通错误文本
+        from wdclaude.vision import get_vision_runtime
+        from wdclaude.vision.vision_client import VisionFatalError
+        try:
+            runtime = get_vision_runtime()
+            return runtime.view_image.execute(p)
+        except VisionFatalError:
+            raise
+        except Exception as e:
+            result = f"[ERROR] view_image 执行失败: {e}"
 
     elif name == "get_file_context":
         from wdclaude.tools.file_context_tool import get_file_context
@@ -1474,6 +1599,17 @@ def execute_code_tool(tool):
         else:
             choices = None
         result = ask_user_question(question=question, choices=choices)
+
+    elif name in ("web_search", "web_fetch"):
+        # 双通道输出：llm_text 注入 LLM 上下文（走下方通用包装），
+        # display 交已注册的 CLI 渲染回调（引擎不 import cli_print）
+        from wdclaude.tools import web_search as _ws
+        if name == "web_search":
+            outcome = _ws.execute_web_search(p)
+        else:
+            outcome = _ws.execute_web_fetch(p)
+        _dispatch_web_display(outcome.get("display"))
+        result = outcome.get("llm_text", "")
 
     else:
         result = "unknown llm_tool"

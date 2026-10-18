@@ -1,4 +1,4 @@
-"""命令扫描器，启动时递归扫描 .myclaude/ 目录，发现并注册所有 .md 文件为斜杠命令。"""
+"""命令扫描器，启动时递归扫描 .wdclaude/commands/ 目录，发现并注册所有 .md 文件为斜杠命令。"""
 
 from pathlib import Path
 
@@ -6,22 +6,28 @@ import yaml
 
 from wdclaude.command import CommandInfo
 from wdclaude.command.registry import CommandRegistry
+from wdclaude.paths import paths as _paths
 
 
 class CommandScanner:
-    """扫描 .myclaude/commands/ 目录，将 .md 文件注册为斜杠命令。"""
+    """扫描 B/.wdclaude/commands/ 目录，将 .md 文件注册为斜杠命令。"""
 
-    def __init__(self, project_root: str | Path, cmd_dir: str = ".myclaude/commands"):
+    def __init__(self, project_root: str | Path, cmd_dir: str | Path | None = None):
         self.project_root = Path(project_root)
-        self.cmd_dir = self.project_root / cmd_dir
+        # 默认锚点：paths.commands_dir（B/.wdclaude/commands，与首启骨架一致）；
+        # 显式传入 cmd_dir 时仍以 project_root/cmd_dir 解析（兼容旧调用）
+        if cmd_dir is None:
+            self.cmd_dir = _paths.commands_dir
+        else:
+            self.cmd_dir = Path(cmd_dir) if Path(cmd_dir).is_absolute() else self.project_root / cmd_dir
 
     def scan(self) -> CommandRegistry:
-        """扫描 .myclaude/ 目录，返回填充好的 CommandRegistry"""
+        """扫描 .wdclaude/commands/ 目录，返回填充好的 CommandRegistry"""
         registry = CommandRegistry()
         if not self.cmd_dir.exists():
             return registry
 
-        for md_file in self.cmd_dir.rglob("*.md"):
+        for md_file in sorted(self.cmd_dir.rglob("*.md")):
             try:
                 command_name = self._path_to_command(md_file)
                 info = self._parse_file(md_file, command_name)
@@ -35,9 +41,9 @@ class CommandScanner:
     def _path_to_command(self, file_path: Path) -> str:
         """将文件路径转换为斜杠命令名
 
-        .myclaude/opsx/propose.md → /opsx:propose
-        .myclaude/deploy.md → /deploy
-        .myclaude/test/unit/run.md → /test:unit:run
+        .wdclaude/commands/opsx/propose.md → /opsx:propose
+        .wdclaude/commands/deploy.md → /deploy
+        .wdclaude/commands/test/unit/run.md → /test:unit:run
         """
         relative = file_path.relative_to(self.cmd_dir)
         parts = list(relative.parts)

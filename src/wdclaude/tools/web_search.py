@@ -1,28 +1,36 @@
-"""互联网搜索工具（web_search）。
+"""互联网搜索与网页抓取工具（web_search / web_fetch）。
 
-提供 Provider 抽象（tavily / bocha / zhipu / duckduckgo 可插拔切换）、
-本地 JSON 缓存（TTL 控制）、最小间隔限流、超时重试与优雅降级。
+配置驱动的 tools 协议实现（spec/web_search_refactor_spec.md）：
+- 端点与密钥来自 model_key.yaml 的 web_search 段（provider 引用命名模型块 +
+  search_api / fetch_api 端点声明字符串），代码不硬编码任何厂商端点；
+- 参数来自 config.yaml 的 web_search 段（开关/触发模式/隐私词/条数/超时/
+  重试/缓存/限流/预算）；
+- 富字段搜索结果（rerank_score / snippet / summary / content / site_name /
+  site_icon / date / authority），CLI 与 LLM 双通道内容分流；
+- web_fetch 单 URL 抓取返回 Markdown，与 file_view（本地文件）互补；
+- 双通道输出契约：工具入口返回 {"llm_text": str, "display": dict}，
+  llm_text 注入 LLM 上下文（token 预算内），display 供 CLI Rich 面板渲染。
 
 工具协议（LLM 侧，自闭合标签）：
-    <web_search query="搜索关键词" max_results="5"/>
 
-执行链路：
-    tool_executor 解析标签 → execute_web_search(params) → 格式化文本回注上下文
+    <web_fetch url="https://example.com/docs"/>
 
 设计约束（遵守项目架构契约）：
-    - 全同步 requests 调用，禁止 async/await
-    - api_key 绝不进入 LLM 上下文（仅出现在 HTTP 请求头中）
-    - 结果注入受 token_budget 控制，防止撑爆上下文
-    - 网络失败/功能关闭时返回明确提示，让 LLM 基于自身知识作答并声明局限
+- 全同步 requests 调用，禁止 async/await
+- api_key 绝不进入 LLM 上下文（仅出现在 HTTP 请求头中）
+- 任何异常不中断 Query Loop（工具入口全包裹 try/except）
 """
 
 import hashlib
+import ipaddress
 import json
 import logging
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -31,42 +39,76 @@ from wdclaude.utility.config_loader import global_cfg
 logger = logging.getLogger(__name__)
 
 
-# ======================== 数据结构 ========================
+# ======================== 数据模型（spec 5.2） ========================
+
+@dataclass
+class SearchRequest:
+    """搜索请求（厂商中立）。"""
+    query: str                          # 1~128 Unicode 字符
+    count: int = 5                      # 钳制 1~50
+    ori_question: str | None = None     # 触发搜索的用户原始问题，<=128 字符
+    need_content: bool = False
+
 
 @dataclass
 class SearchResult:
-    """单条搜索结果"""
+    """单条搜索结果（富字段，厂商中立）。"""
     title: str
     url: str
-    snippet: str
+    snippet: str = ""               # 100~200 字符，面向 CLI 展现
+    summary: str = ""               # 600~800 字符，面向模型阅读
+    content: str = ""               # need_content=true 时有值
+    site_name: str | None = None
+    site_icon: str | None = None    # 本期仅留存字段，不渲染图标
+    date: str | None = None         # UTC RFC 3339
+    authority: int | None = None    # 0~4，-1 未知，>=3 为极权威
+    rerank_score: float | None = None   # 0~3，>=1.5 为优质结果
 
 
 @dataclass
+class FetchResult:
+    """单 URL 抓取结果。"""
+    url: str
+    title: str = ""             # 页面标题（API title，缺失为空字符串）
+    markdown: str = ""          # Markdown 正文（API content 字段）
+    fetched_at: str = ""        # 本地记录的 ISO 时间
+    truncated: bool = False     # 注入预算截断标记
+
+
+# ======================== 配置模型与加载（spec 4 章） ========================
+
+@dataclass
 class WebSearchConfig:
-    """web_search 全量配置（从 config.yaml + model_key.yaml 合并读取）"""
-    provider: str = "tavily"
+    """web_search / web_fetch 全量配置。
+
+    敏感字段（provider / search_api / fetch_api）来自 model_key.yaml 的
+    web_search 段；参数字段来自 config.yaml 的 web_search 段（经 config_loader
+    深度合并后统一从 global_cfg.web_search 读取）。
+    """
+    # ----- model_key.yaml web_search 段（端点与密钥引用） -----
+    provider: str = ""           # 命名模型块引用（如 "DeepSeek-main"）
+    search_api: str = ""         # 搜索端点声明 "METHOD URL"
+    fetch_api: str = ""          # 抓取端点声明（选填，缺失仅禁用 web_fetch）
+    # ----- provider 引用块解析结果 -----
     api_key: str = ""
     base_url: str = ""
+    # ----- config.yaml web_search 参数段 -----
     enabled: bool = False
-    trigger_mode: str = "auto"      # auto / explicit / private
-    sensitive_words: tuple = ()     # 用户自定义受保护词汇（query 命中即拒绝）
-    max_results: int = 5
-    timeout: int = 10
-    max_retries: int = 2
-    cache_ttl: int = 3600
-    token_budget: int = 3000
-    min_interval: float = 2.0
-    # zhipu 降级链路（403 修复）：独立搜索接口无召回时，降级到 chat+web_search 工具链路。
-    # 实测（2026-10-04）：web-search-pro 独立接口对天气/实时类查询 0 召回（8 种参数组合均失败），
-    # 但 chat completions + tools(web_search) 链路能返回实时天气数据（带搜索引用）。
-    fallback_model: str = "glm-4-flash"       # 降级链路使用的 chat 模型（免费）
-    fallback_max_results: int = 5             # 降级链路最多提取的结果条数
+    trigger_mode: str = "private"        # auto / explicit / private
+    sensitive_words: tuple = ()          # 受保护词汇（query / URL 命中即拒绝）
+    max_results: int = 5                 # 默认返回条数（映射 API count，钳制 1~50）
+    need_content: bool = False           # 是否随搜索返回网页正文 content
+    timeout: int = 10                    # HTTP 超时（秒），search 与 fetch 共用
+    max_retries: int = 2                 # 失败重试次数（指数退避）
+    cache_ttl: int = 3600                # 缓存有效期（秒），0 禁用；search/fetch 独立缓存
+    token_budget: int = 3000             # 单次搜索结果注入 token 预算
+    fetch_token_budget: int = 3000       # 单次抓取内容注入 token 预算
+    min_interval: float = 2.0            # 两次真实请求（search/fetch 合计）最小间隔（秒）
+    max_calls_per_session: int = 10      # 会话级调用上限（search/fetch 分别计数），0 = 不限
 
-
-# ======================== 配置加载 ========================
 
 def _to_bool(value) -> bool:
-    """兼容 YAML 中的布尔值与字符串写法（true/"True"/"1"/"on"）"""
+    """兼容 YAML 中的布尔值与字符串写法（true/"True"/"1"/"on"）。"""
     if isinstance(value, str):
         return value.strip().lower() in ("true", "yes", "1", "on")
     return bool(value)
@@ -86,405 +128,121 @@ def _to_float(value, default: float) -> float:
         return default
 
 
+def _to_int_safe(value):
+    """宽容 int 转换：失败返回 None（用于响应字段归一化）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_float_safe(value):
+    """宽容 float 转换：失败返回 None（用于响应字段归一化）。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def load_ws_config() -> WebSearchConfig:
-    """从 global_cfg 读取 web_search 配置段，缺省值兜底（配置缺失不影响启动）"""
+    """从 global_cfg 读取 web_search 配置段（model_key 与 config 合并后的结果）。
+
+    配置缺失时返回全默认值（不影响启动）；旧形态检测（缺 search_api）
+    由工具入口完成并返回配置指引。
+    """
     cfg = WebSearchConfig()
     ws = getattr(global_cfg, "web_search", None)
     if ws is None:
         return cfg
-    cfg.provider = str(getattr(ws, "provider", cfg.provider)).strip().lower()
-    cfg.api_key = str(getattr(ws, "api_key", cfg.api_key)).strip()
-    cfg.base_url = str(getattr(ws, "base_url", cfg.base_url)).strip()
-    # base_url 防御性规范化：常见配置失误是漏写协议前缀（如 api.xxx.com/v1/search），
-    # requests 会抛 "Invalid URL: No scheme supplied"。自动补 https:// 前缀。
-    if cfg.base_url and not cfg.base_url.startswith(("http://", "https://")):
-        cfg.base_url = "https://" + cfg.base_url
+    # model_key.yaml 侧字段（新形态：provider 引用 + 端点声明）
+    cfg.provider = str(getattr(ws, "provider", "") or "").strip()
+    cfg.search_api = str(getattr(ws, "search_api", "") or "").strip()
+    cfg.fetch_api = str(getattr(ws, "fetch_api", "") or "").strip()
+    # config.yaml 侧参数
     cfg.enabled = _to_bool(getattr(ws, "enabled", cfg.enabled))
-    # 触发模式：auto=LLM自主 / explicit=仅用户明确要求 / private=自主但query仅限通用技术词汇
-    cfg.trigger_mode = str(getattr(ws, "trigger_mode", cfg.trigger_mode)).strip().lower()
-    if cfg.trigger_mode not in ("auto", "explicit", "private"):
-        cfg.trigger_mode = "auto"
+    trigger_mode = str(getattr(ws, "trigger_mode", cfg.trigger_mode)).strip().lower()
+    cfg.trigger_mode = trigger_mode if trigger_mode in ("auto", "explicit", "private") else "private"
     raw_words = getattr(ws, "sensitive_words", None) or []
     if isinstance(raw_words, str):
         raw_words = [raw_words]
     cfg.sensitive_words = tuple(str(w).strip() for w in raw_words if str(w).strip())
     cfg.max_results = _to_int(getattr(ws, "max_results", cfg.max_results), cfg.max_results)
+    cfg.need_content = _to_bool(getattr(ws, "need_content", cfg.need_content))
     cfg.timeout = _to_int(getattr(ws, "timeout", cfg.timeout), cfg.timeout)
     cfg.max_retries = _to_int(getattr(ws, "max_retries", cfg.max_retries), cfg.max_retries)
     cfg.cache_ttl = _to_int(getattr(ws, "cache_ttl", cfg.cache_ttl), cfg.cache_ttl)
     cfg.token_budget = _to_int(getattr(ws, "token_budget", cfg.token_budget), cfg.token_budget)
+    cfg.fetch_token_budget = _to_int(
+        getattr(ws, "fetch_token_budget", cfg.fetch_token_budget), cfg.fetch_token_budget)
     cfg.min_interval = _to_float(getattr(ws, "min_interval", cfg.min_interval), cfg.min_interval)
-    # 降级链路配置（403 修复）
-    cfg.fallback_model = str(getattr(ws, "fallback_model", cfg.fallback_model)).strip() or "glm-4-flash"
-    cfg.fallback_max_results = _to_int(getattr(ws, "fallback_max_results", cfg.fallback_max_results), cfg.fallback_max_results)
+    cfg.max_calls_per_session = _to_int(
+        getattr(ws, "max_calls_per_session", cfg.max_calls_per_session), cfg.max_calls_per_session)
     return cfg
 
 
-# ======================== Provider 抽象层 ========================
+# ======================== 端点声明解析（spec 4.3） ========================
 
-class SearchProvider:
-    """搜索后端抽象基类：实现 search() 即可插拔接入"""
-
-    name = "base"
-
-    def __init__(self, cfg: WebSearchConfig):
-        self.cfg = cfg
+_HTTP_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
 
 
-    def search(self, query: str, max_results: int) -> list:
-        raise NotImplementedError
+def parse_endpoint(decl: str, base_url: str = "") -> tuple:
+    """解析端点声明字符串 "METHOD URL"。
 
+    规则（spec 4.3）：
+    - METHOD：缺省默认 POST；声明其他方法（GET 等）时报错"暂不支持"；
+    - URL：必须含协议（http/https），缺协议自动补 https://；
+      以 / 开头的相对路径拼接 provider 引用块的 base_url。
 
-    def _post_with_retry(self, url: str, headers: dict, payload: dict) -> dict:
-        """带指数退避重试的同步 POST 请求。
-
-        认证类错误（401/403）不重试，直接抛出。
-        """
-        last_err = None
-        for attempt in range(self.cfg.max_retries + 1):
-            try:
-                resp = requests.post(
-                    url, json=payload, headers=headers, timeout=self.cfg.timeout
-                )
-                resp.raise_for_status()
-                return resp.json()
-            except requests.exceptions.Timeout as e:
-                last_err = f"请求超时（{self.cfg.timeout}s），可能是网络波动或需要代理"
-            except requests.exceptions.ConnectionError as e:
-                last_err = f"连接失败（检查网络连通性/代理设置）: {e}"
-            except requests.exceptions.HTTPError as e:
-                code = e.response.status_code if e.response is not None else "?"
-                last_err = f"HTTP {code} 错误: {e}"
-                if code in (401, 403, 402):
-                    break  # 认证/配额类错误重试无意义
-            except (ValueError, KeyError) as e:
-                last_err = f"响应解析失败: {e}"
-            except requests.exceptions.RequestException as e:
-                last_err = f"请求异常: {e}"
-            if attempt < self.cfg.max_retries:
-                time.sleep(2 ** attempt)  # 指数退避：1s, 2s
-        raise RuntimeError(last_err or "未知请求错误")
-
-
-class TavilyProvider(SearchProvider):
-    """Tavily：专为 LLM/RAG 设计，海外网络环境，免费额度 1000 次/月"""
-    name = "tavily"
-    DEFAULT_URL = "https://api.tavily.com/search"
-
-
-    def search(self, query: str, max_results: int) -> list:
-        url = self.cfg.base_url or self.DEFAULT_URL
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.cfg.api_key}",
-        }
-        payload = {
-            "query": query,
-            "max_results": max_results,
-            "search_depth": "basic",
-            "include_answer": False,
-            "include_raw_content": False,
-        }
-        data = self._post_with_retry(url, headers, payload)
-        results = []
-        for item in (data.get("results") or [])[:max_results]:
-            results.append(SearchResult(
-                title=(item.get("title") or "").strip(),
-                url=(item.get("url") or "").strip(),
-                snippet=(item.get("content") or item.get("snippet") or "").strip(),
-            ))
-        return results
-
-
-class BochaProvider(SearchProvider):
-    """博查：国产搜索后端，国内直连，对中文内容召回较好"""
-    name = "bocha"
-    DEFAULT_URL = "https://api.bochaai.com/v1/web-search"
-
-
-    def search(self, query: str, max_results: int) -> list:
-        url = self.cfg.base_url or self.DEFAULT_URL
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.cfg.api_key}",
-        }
-        payload = {"query": query, "count": max_results, "summary": True}
-        data = self._post_with_retry(url, headers, payload)
-        results = []
-        pages = (data.get("data") or {}).get("webPages") or {}
-        for item in (pages.get("value") or [])[:max_results]:
-            results.append(SearchResult(
-                title=(item.get("name") or "").strip(),
-                url=(item.get("url") or "").strip(),
-                snippet=(item.get("summary") or item.get("snippet") or "").strip(),
-            ))
-        return results
-
-
-class ZhipuProvider(SearchProvider):
-    """智谱 web-search-pro：复用 GLM API Key，国内直连，中文召回好。
-
-    特殊性：走智谱 tools 端点（非标准搜索接口），请求体传 model="web-search-pro"，
-    结果嵌在 choices[0].message.tool_calls[*].search_result 数组中。
-    官方不支持指定返回条数，取回后客户端截断到 max_results。
+    Returns:
+        (method, url)；解析失败抛出 ValueError。
     """
-    name = "zhipu"
-    DEFAULT_URL = "https://open.bigmodel.cn/api/paas/v4/tools"
+    text = (decl or "").strip()
+    if not text:
+        raise ValueError("端点声明为空")
+    tokens = text.split()
+    if tokens[0].upper() in _HTTP_METHODS and len(tokens) > 1:
+        method = tokens[0].upper()
+        url = text[len(tokens[0]):].strip()
+    else:
+        method = "POST"
+        url = text
+    if method != "POST":
+        raise ValueError(f"端点方法 {method} 暂不支持（当前仅支持 POST）")
+    if not url:
+        raise ValueError("端点声明缺少 URL")
+    if url.startswith("/"):
+        if not base_url:
+            raise ValueError("相对路径端点需要 provider 引用块的 base_url 作为拼接基准")
+        url = base_url.rstrip("/") + url
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return method, url
 
 
-    def search(self, query: str, max_results: int) -> list:
-        url = self.cfg.base_url or self.DEFAULT_URL
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.cfg.api_key}",
-        }
-        payload = {
-            "model": "web-search-pro",
-            "messages": [{"role": "user", "content": query}],
-            "stream": False,
-        }
-        data = self._post_with_retry(url, headers, payload)
-        # 业务层错误：智谱部分错误以 200 + error 字段返回
-        if data.get("error"):
-            err = data["error"]
-            msg = err.get("message") if isinstance(err, dict) else str(err)
-            raise RuntimeError(f"智谱接口返回错误: {msg}")
-        choices = data.get("choices") or []
-        if not choices:
-            return []
-        message = choices[0].get("message") or {}
-        tool_calls = message.get("tool_calls") or []
-        results = []
-        for call in tool_calls:
-            for item in (call.get("search_result") or []):
-                results.append(SearchResult(
-                    title=(item.get("title") or "").strip(),
-                    url=(item.get("link") or item.get("url") or "").strip(),
-                    snippet=(item.get("content") or item.get("snippet") or "").strip(),
-                ))
-        return results[:max_results]
+def _resolve_provider_ref(cfg: WebSearchConfig) -> tuple:
+    """解析 provider 引用块（spec 4.2 解析规则 1）。
 
+    引用块必须存在且含非空 api_key（模板占位视为空），成功时把 api_key 与
+    base_url 写回 cfg（base_url 作为相对路径端点的拼接基准）。
 
-class DuckDuckGoProvider(SearchProvider):
-    """DuckDuckGo：免 Key 后端，依赖 duckduckgo-search 库，稳定性一般"""
-    name = "duckduckgo"
-
-
-    def search(self, query: str, max_results: int) -> list:
-        try:
-            from duckduckgo_search import DDGS
-        except ImportError:
-            raise RuntimeError(
-                "未安装 duckduckgo-search 库，请执行: pip install duckduckgo-search"
-            )
-        results = []
-        try:
-            with DDGS(timeout=self.cfg.timeout) as ddgs:
-                for item in ddgs.text(query, max_results=max_results):
-                    results.append(SearchResult(
-                        title=(item.get("title") or "").strip(),
-                        url=(item.get("href") or item.get("url") or "").strip(),
-                        snippet=(item.get("body") or "").strip(),
-                    ))
-        except Exception as e:
-            raise RuntimeError(f"DuckDuckGo 搜索失败: {e}")
-        return results
-
-
-class ZhipuChatFallbackProvider(SearchProvider):
-    """zhipu 降级链路：chat completions + tools(web_search)（403 修复）。
-
-    背景：web-search-pro 独立搜索接口对天气/实时类查询无召回（内容过滤），
-    但同一 API key 走 chat completions 且携带 web_search 工具时，模型会
-    实际联网并返回带引用的实时数据。
-
-    实现策略：
-    1. 用 query 构造 user 消息 + tools=[{type: web_search, enable: true}]
-    2. 调用 chat completions（glm-4-flash，免费模型）
-    3. 从回复 content 中提取搜索结果：
-       a. 优先取 message.web_search 搜索引擎字段（若返回结构含搜索源）
-       b. 回复文本本身即答案（含【N†source】引用），包装为单条结果
+    Returns:
+        (ok, err_msg)：ok=False 时 err_msg 为给 LLM 的错误说明。
     """
-    name = "zhipu_chat"
-
-    CHAT_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-
-
-    def search(self, query: str, max_results: int, search_query: str = None) -> list:
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.cfg.api_key}",
-        }
-        # search_query 强制指定搜索词：实测（2026-10-04）不带此参数时
-        # glm-4-flash 的 web_search 工具触发不稳定（约半数回复"无法联网"，
-        # 模型自行决定是否搜索）；带此参数后稳定返回带引用的实时数据。
-        # 404 修复：默认用清洗后的核心实体词（剥离"是什么"等疑问后缀）。
-        # 实测带污染词（"DSH 是什么"）时，模型会强行解释导致幻觉回答
-        # （把 DSH 说成区块链存储）；清洗词让搜索聚焦实体本身。
-        if search_query is None:
-            search_query = " ".join(_extract_core_terms(query)) or query
-        payload = {
-            "model": self.cfg.fallback_model,
-            "messages": [
-                {"role": "user", "content": f"{query}"}
-            ],
-            "tools": [{
-                "type": "web_search",
-                "web_search": {
-                    "enable": True,
-                    "search_query": search_query,   # 强制搜索词，禁用模型自主决策
-                    "search_result": True,   # 要求返回搜索结果
-                },
-            }],
-            "stream": False,
-            "temperature": 0.1,
-            "max_tokens": 2000,
-        }
-        data = self._post_with_retry(self.CHAT_URL, headers, payload)
-        if data.get("error"):
-            err = data["error"]
-            msg = err.get("message") if isinstance(err, dict) else str(err)
-            raise RuntimeError(f"zhipu chat 降级链路错误: {msg}")
-
-        choices = data.get("choices") or []
-        if not choices:
-            return []
-        message = choices[0].get("message") or {}
-        content = (message.get("content") or "").strip()
-        if not content:
-            return []
-
-        # 优先提取搜索源信息（zhipu 部分模型在 message.web_search 中返回搜索结果列表）
-        ws_field = message.get("web_search") or choices[0].get("web_search")
-        results = []
-        if isinstance(ws_field, list):
-            for item in ws_field[:max_results]:
-                if isinstance(item, dict):
-                    results.append(SearchResult(
-                        title=(item.get("title") or "").strip(),
-                        url=(item.get("link") or item.get("url") or "").strip(),
-                        snippet=(item.get("content") or item.get("snippet") or "").strip(),
-                    ))
-
-        # 无结构化搜索源时，将带引用的回复文本包装为答案结果
-        if not results:
-            results.append(SearchResult(
-                title=f"[zhipu 联网回答] {query}",
-                url="https://open.bigmodel.cn",
-                snippet=content[:1500],
-            ))
-        return results[:max_results]
+    if not cfg.provider:
+        return False, "provider 未配置（model_key.yaml web_search.provider）"
+    block = getattr(global_cfg, cfg.provider, None)
+    if block is None:
+        return False, f"provider 引用块 '{cfg.provider}' 未在 model_key.yaml 顶层定义"
+    api_key = str(getattr(block, "api_key", "") or "").strip()
+    if (not api_key or "在此填写" in api_key or api_key.startswith("sk-xxx")
+            or not api_key.strip("*")):
+        return False, f"provider 引用块 '{cfg.provider}' 的 api_key 为空或仍为模板占位"
+    cfg.api_key = api_key
+    cfg.base_url = str(getattr(block, "base_url", "") or "").strip()
+    return True, ""
 
 
-_PROVIDERS = {
-    TavilyProvider.name: TavilyProvider,
-    BochaProvider.name: BochaProvider,
-    ZhipuProvider.name: ZhipuProvider,
-    DuckDuckGoProvider.name: DuckDuckGoProvider,
-    ZhipuChatFallbackProvider.name: ZhipuChatFallbackProvider,
-}
-
-
-def create_provider(cfg: WebSearchConfig) -> SearchProvider:
-    """工厂函数：按配置实例化搜索后端"""
-    cls = _PROVIDERS.get(cfg.provider)
-    if cls is None:
-        raise RuntimeError(
-            f"未知的搜索后端 provider: {cfg.provider}，可选: {list(_PROVIDERS.keys())}"
-        )
-    return cls(cfg)
-
-
-# ======================== 本地缓存（JSON 文件 + TTL） ========================
-
-class SearchCache:
-    """搜索结果本地缓存：同 query 在 TTL 内直接命中，节省 API 配额"""
-
-    def __init__(self, cache_path: Path, ttl: int, max_entries: int = 200):
-        self.path = cache_path
-        self.ttl = ttl
-        self.max_entries = max_entries
-        self._data = {}
-        self._load()
-
-
-    def _load(self):
-        if self.path.exists():
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    self._data = json.load(f)
-            except (OSError, ValueError) as e:
-                logger.warning(f"搜索缓存读取失败，忽略: {e}")
-                self._data = {}
-
-
-    def _save(self):
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, ensure_ascii=False)
-        except OSError as e:
-            logger.warning(f"搜索缓存写入失败: {e}")
-
-
-    @staticmethod
-    def _key(query: str, max_results: int) -> str:
-        return hashlib.md5(f"{query}|{max_results}".encode("utf-8")).hexdigest()
-
-
-    def get(self, query: str, max_results: int):
-        """命中返回结果列表（dict 形式），未命中返回 None"""
-        if self.ttl <= 0:
-            return None
-        key = self._key(query, max_results)
-        entry = self._data.get(key)
-        if not entry:
-            return None
-        if time.time() - entry.get("ts", 0) > self.ttl:
-            self._data.pop(key, None)
-            return None
-        return entry.get("results") or []
-
-
-    def put(self, query: str, max_results: int, results: list):
-        if self.ttl <= 0:
-            return
-        key = self._key(query, max_results)
-        self._data[key] = {
-            "query": query[:100],
-            "ts": time.time(),
-            "results": [
-                {"title": r.title, "url": r.url, "snippet": r.snippet} for r in results
-            ],
-        }
-        # 容量控制：超限时淘汰最旧的一半条目
-        if len(self._data) > self.max_entries:
-            sorted_items = sorted(self._data.items(), key=lambda kv: kv[1].get("ts", 0))
-            for k, _ in sorted_items[:len(sorted_items) // 2]:
-                self._data.pop(k, None)
-        self._save()
-
-
-# ======================== 限流器（最小间隔） ========================
-
-class RateLimiter:
-    """最小间隔限流：防止 LLM 连续刷搜索耗尽 API 配额"""
-
-    def __init__(self, min_interval: float):
-        self.min_interval = min_interval
-        self._last_call = 0.0
-
-
-    def wait(self):
-        if self.min_interval <= 0:
-            return
-        elapsed = time.time() - self._last_call
-        if elapsed < self.min_interval:
-            time.sleep(self.min_interval - elapsed)
-        self._last_call = time.time()
-
-
-# ======================== 隐私过滤（代码级硬约束） ========================
+# ======================== 隐私过滤（代码级硬约束，spec 9.3 L2） ========================
 
 # 高置信敏感模式：命中即拒绝，所有 trigger_mode 下均生效。
 # 路径/密钥类内容对搜索本身无价值，出现在 query 里只会泄露项目内部信息。
@@ -513,82 +271,492 @@ def check_query_privacy(query: str, sensitive_words: tuple = ()) -> str:
     return ""
 
 
-# ======================== 查询清洗与相关性评估（404 修复） ========================
+# ======================== fetch URL 安全校验（spec 7.3） ========================
 
-# 疑问/修饰类噪声词（后缀剥离 + 独立词过滤）
-_QUERY_NOISE_WORDS = {
-    '是什么', '什么意思', '什么', '是啥', '怎么样', '怎样', '如何', '为什么',
-    '介绍', '介绍一下', '详细', '详细讲述', '详细讲', '讲解', '讲讲', '说说',
-    '请', '请问', '帮我', '帮忙', '查一下', '查查', '搜索', '检索', '一下',
-    '呢', '啊', '呀', '么', '吗', '把', '给我',
-    'the', 'a', 'an', 'of', 'is', 'what', 'how', 'why',
-}
-# 通用领域词：单独出现时无区分度，不作为相关性判断依据
-_GENERIC_TERMS = {
-    '技术', '原理', '框架', '工具', '平台', '系统', '功能', '应用', '产品',
-    '公司', '最新', '新闻', '发布', '开源', '教程', '指南', '对比', '区别',
-    'framework', 'tool', 'platform', 'library', 'release', 'news',
-}
+_PRIVATE_HOSTNAMES = {"localhost"}
 
 
-def _extract_core_terms(query: str) -> list:
-    """提取 query 的核心实体词：剥离疑问后缀与噪声词。
+def _check_fetch_url(url: str, sensitive_words: tuple = ()) -> str:
+    """fetch URL 安全校验。返回命中原因，合法返回空字符串。
 
-    404 现场：'DeepSeek Harness DSH 是什么' -> ['DeepSeek', 'Harness', 'DSH']
-    （'是什么' 为疑问后缀被剥离；正是它触发 zhipu 意图层把 'Harness DSH'
-    误改写为 'adhh'，导致召回 5 条仅 1 条相关）
+    拒绝清单（代码级硬约束）：
+    - 非 http/https 协议（file://、ftp:// 等）；
+    - 本地与内网地址：localhost、127.0.0.0/8、10.0.0.0/8、172.16.0.0/12、
+      192.168.0.0/16、169.254.0.0/16、::1、*.local（字面 IP 判定，
+      不做 DNS 解析——解析结果可被 DNS rebinding 绕过且增加同步延迟）；
+    - 命中 sensitive_words 的 URL；
+    - API 侧 url 约束的本地预检：长度超 8192、缺 host、携带用户名/密码。
     """
-    tokens = re.split(r'[\s,，、;；:：?？!！]+', query)
-    terms = []
-    for t in tokens:
-        t = t.strip()
-        if not t:
-            continue
-        # 剥离尾部疑问后缀（最长优先，可重复剥离）
-        changed = True
-        while changed:
-            changed = False
-            for sw in sorted(_QUERY_NOISE_WORDS, key=len, reverse=True):
-                if t == sw:
-                    t = ''
-                    changed = False
-                    break
-                if t.endswith(sw) and len(t) > len(sw):
-                    t = t[:-len(sw)].strip()
-                    changed = True
-            if t == '':
-                break
-        if not t or t in _QUERY_NOISE_WORDS or t in _GENERIC_TERMS:
-            continue
-        terms.append(t)
-    return terms
+    text = (url or "").strip()
+    if not text:
+        return "URL 为空"
+    if len(text) > 8192:
+        return "URL 长度超过 8192 字符"
+    try:
+        parsed = urlparse(text)
+    except ValueError as e:
+        return f"URL 无法解析: {e}"
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        return f"非 http/https 协议（{scheme or '协议缺失'}）"
+    host = (parsed.hostname or "").lower().strip(".")
+    if not host:
+        return "URL 缺少 host"
+    if parsed.username or parsed.password:
+        return "URL 携带用户名/密码（禁止 user:pass@host 形态）"
+    if host in _PRIVATE_HOSTNAMES or host.endswith(".localhost"):
+        return f"本地地址（{host}）禁止抓取"
+    if host.endswith(".local"):
+        return f"本地域名（*.local）禁止抓取"
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        addr = None
+    if addr is not None and not addr.is_global:
+        return f"内网/本地 IP（{addr}）禁止抓取"
+    for w in sensitive_words:
+        if w and w.lower() in text.lower():
+            return f"受保护词汇 '{w}'"
+    return ""
 
 
-def _assess_relevance(results: list, core_terms: list):
-    """评估召回结果与核心实体词的相关性（稀有词命中法）。
+# ======================== 基础设施：缓存 / 限流 / 会话计数（spec 5.5） ========================
 
-    稀有词 = 在结果集（标题+摘要）中出现次数 ≤ 半数结果的核心词。
-    判定依据：宽泛词（如 DeepSeek）在所有结果中都出现，无区分度；
-    稀有词（如 Harness/DSH）才是用户真正要查的实体。
+class NamespacedKVCache:
+    """本地 JSON 文件 KV 缓存（TTL 控制 + 容量淘汰）。
+
+    search 与 fetch 各持有一个实例（不同文件路径），条目按全字段序列化。
+    """
+
+    def __init__(self, cache_path: Path, ttl: int, max_entries: int = 200):
+        self.path = Path(cache_path)
+        self.ttl = ttl
+        self.max_entries = max_entries
+        self._data = {}
+        self._load()
+
+
+    def _load(self):
+        if self.path.exists():
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self._data = json.load(f)
+            except (OSError, ValueError) as e:
+                logger.warning(f"缓存读取失败，忽略: {e}")
+                self._data = {}
+
+
+    def _save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, ensure_ascii=False)
+        except OSError as e:
+            logger.warning(f"缓存写入失败: {e}")
+
+
+    def get(self, key: str):
+        """命中返回条目 value，未命中/过期返回 None。"""
+        if self.ttl <= 0:
+            return None
+        entry = self._data.get(key)
+        if not isinstance(entry, dict):
+            return None
+        if time.time() - entry.get("ts", 0) > self.ttl:
+            self._data.pop(key, None)
+            return None
+        return entry.get("value")
+
+
+    def put(self, key: str, value):
+        if self.ttl <= 0:
+            return
+        self._data[key] = {"ts": time.time(), "value": value}
+        # 容量控制：超限时淘汰最旧的一半条目
+        if len(self._data) > self.max_entries:
+            sorted_items = sorted(self._data.items(), key=lambda kv: kv[1].get("ts", 0))
+            for k, _ in sorted_items[:len(sorted_items) // 2]:
+                self._data.pop(k, None)
+        self._save()
+
+
+class RateLimiter:
+    """最小间隔限流：search 与 fetch 共用同一实例，防止 LLM 连续刷请求耗尽配额。"""
+
+    def __init__(self, min_interval: float):
+        self.min_interval = min_interval
+        self._last_call = 0.0
+
+
+    def wait(self):
+        if self.min_interval <= 0:
+            return
+        elapsed = time.time() - self._last_call
+        if elapsed < self.min_interval:
+            time.sleep(self.min_interval - elapsed)
+        self._last_call = time.time()
+
+
+# 会话级调用计数器：模块级单例（spec 5.5），search 与 fetch 分别计数；
+# 进程内跨 Query 累积，新 Session 由 query_loop.new_session() 调用重置
+_session_call_counts = {"web_search": 0, "web_fetch": 0}
+
+
+def reset_session_counters():
+    """重置会话级调用计数（新 Session 时由 query_loop 调用）。"""
+    for k in _session_call_counts:
+        _session_call_counts[k] = 0
+
+
+def _check_session_limit(tool: str, cfg: WebSearchConfig) -> tuple:
+    """会话级调用上限检查（spec 9.3 L2 硬守卫）。
 
     Returns:
-        (relevant_ratio, rare_terms)
-        - relevant_ratio: 含至少一个稀有词的结果占比
-        - rare_terms: 稀有词列表（空列表表示无法判定，视为相关）
+        (hit, notice)：hit=True 时 notice 为给 LLM 的提示（基于已有信息作答）。
     """
-    if not results or not core_terms:
-        return 1.0, []
-    n = len(results)
-    texts = [(r.title or '') + ' ' + (r.snippet or '') for r in results]
-    rare = []
-    for term in core_terms:
-        df = sum(1 for t in texts if term.lower() in t.lower())
-        if df <= max(1, n // 2):
-            rare.append(term)
-    if not rare:
-        return 1.0, []
-    hit = sum(1 for t in texts if any(rm.lower() in t.lower() for rm in rare))
-    return hit / n, rare
+    limit = cfg.max_calls_per_session
+    if limit <= 0:
+        return False, ""
+    used = _session_call_counts.get(tool, 0)
+    if used >= limit:
+        return True, (
+            f"[BLOCKED] {tool} 已达会话级调用上限（{limit} 次）。"
+            f"请基于已有信息作答，并向用户说明联网查询配额已用尽。"
+        )
+    return False, ""
+
+
+# 模块级单例（缓存 / 限流），进程生命周期
+_search_cache_instance = None
+_fetch_cache_instance = None
+_rate_limiter_instance = None
+
+
+def _get_search_cache(cfg: WebSearchConfig) -> NamespacedKVCache:
+    global _search_cache_instance
+    if _search_cache_instance is None:
+        cache_path = Path(global_cfg.base_path.logs_root) / "web_search_cache.json"
+        _search_cache_instance = NamespacedKVCache(cache_path, cfg.cache_ttl)
+    return _search_cache_instance
+
+
+def _get_fetch_cache(cfg: WebSearchConfig) -> NamespacedKVCache:
+    global _fetch_cache_instance
+    if _fetch_cache_instance is None:
+        cache_path = Path(global_cfg.base_path.logs_root) / "web_fetch_cache.json"
+        _fetch_cache_instance = NamespacedKVCache(cache_path, cfg.cache_ttl)
+    return _fetch_cache_instance
+
+
+def _get_rate_limiter(cfg: WebSearchConfig) -> RateLimiter:
+    global _rate_limiter_instance
+    if _rate_limiter_instance is None:
+        _rate_limiter_instance = RateLimiter(cfg.min_interval)
+    return _rate_limiter_instance
+
+
+def _search_cache_key(query: str, count: int, need_content: bool) -> str:
+    """缓存键：query + count + need_content 三维度（spec 5.5）。"""
+    return hashlib.md5(f"{query}|{count}|{need_content}".encode("utf-8")).hexdigest()
+
+
+def _fetch_cache_key(url: str) -> str:
+    return hashlib.md5(url.encode("utf-8")).hexdigest()
+
+
+# ======================== 服务层：抽象 + tools 协议实现（spec 5.3） ========================
+
+class WebApiError(Exception):
+    """tools 协议 API 错误（携带 HTTP 状态码与归一化消息）。"""
+
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+
+class WebSearchService:
+    """搜索/抓取服务门面抽象：search 与 fetch 两个能力原语，数据模型厂商中立。"""
+
+    def search(self, req: SearchRequest) -> list:
+        raise NotImplementedError
+
+
+    def fetch(self, url: str) -> FetchResult:
+        raise NotImplementedError
+
+
+class ToolsApiSearchService(WebSearchService):
+    """配置驱动的 tools 协议实现（本期唯一实现）。
+
+    端点与密钥全部来自配置；请求体/响应体按 tools 协议构造与归一化。
+    未来他厂若暴露同构 API（POST JSON + Bearer + results 数组），零代码改动
+    即可接入；若协议异构，则新增 WebSearchService 实现类并经配置选择。
+    """
+
+    # 可重试状态码（spec 12 章：408/429/500/504 等待后重试；其余 4xx 不重试）
+    _RETRYABLE_STATUS = {408, 429, 500, 504}
+
+    def __init__(self, cfg: WebSearchConfig):
+        self.cfg = cfg
+        self._search_method, self._search_url = parse_endpoint(cfg.search_api, cfg.base_url)
+        self._fetch_method = ""
+        self._fetch_url = ""
+        if cfg.fetch_api:
+            self._fetch_method, self._fetch_url = parse_endpoint(cfg.fetch_api, cfg.base_url)
+
+
+    def _headers(self) -> dict:
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.cfg.api_key}",
+        }
+
+
+    @staticmethod
+    def _extract_error_message(resp) -> str:
+        """从 OpenAI 兼容错误体提取 error.message（spec 8.png 错误格式）。
+
+        错误体形如 {"error": {"message", "type", "param": null, "code"}}；
+        HTTPError 时优先提取 error.message 呈现给 LLM。
+        """
+        try:
+            data = resp.json()
+        except ValueError:
+            return (resp.text or "")[:300] or "（无响应体）"
+        if isinstance(data, dict):
+            err = data.get("error")
+            if isinstance(err, dict):
+                msg = str(err.get("message") or "").strip()
+                if msg:
+                    detail = []
+                    if err.get("type"):
+                        detail.append(f"type={err['type']}")
+                    if err.get("code") is not None:
+                        detail.append(f"code={err['code']}")
+                    suffix = f"（{', '.join(detail)}）" if detail else ""
+                    return f"{msg}{suffix}"
+            if data.get("message"):
+                return str(data["message"])[:300]
+        return str(data)[:300]
+
+
+    def _post_json(self, url: str, payload: dict) -> dict:
+        """带指数退避重试的同步 POST，返回解析后的 JSON dict。
+
+        - 408/429/500/504/超时/连接错误 → 指数退避重试（1s, 2s），上限 max_retries；
+        - 400/401/402/403/404/413 等 → 不重试，抛 WebApiError；
+        - 200 但响应非 JSON → 抛 WebApiError（附原始响应前 500 字符）。
+        """
+        last_err = None
+        for attempt in range(self.cfg.max_retries + 1):
+            try:
+                resp = requests.post(url, json=payload, headers=self._headers(),
+                                     timeout=self.cfg.timeout)
+            except requests.exceptions.Timeout:
+                last_err = f"请求超时（{self.cfg.timeout}s），可能是网络波动或需要代理"
+            except requests.exceptions.ConnectionError as e:
+                last_err = f"连接失败（检查网络连通性/代理设置）: {e}"
+            except requests.exceptions.RequestException as e:
+                last_err = f"请求异常: {e}"
+            else:
+                if resp.status_code == 200:
+                    try:
+                        return resp.json()
+                    except ValueError as e:
+                        raise WebApiError(
+                            200,
+                            f"响应解析失败（非 JSON）: {e}；"
+                            f"原始响应前 500 字符: {(resp.text or '')[:500]}"
+                        ) from e
+                msg = self._extract_error_message(resp)
+                if resp.status_code in self._RETRYABLE_STATUS:
+                    last_err = f"HTTP {resp.status_code}: {msg}"
+                else:
+                    raise WebApiError(resp.status_code, msg)
+            if attempt < self.cfg.max_retries:
+                time.sleep(2 ** attempt)  # 指数退避：1s, 2s
+        raise RuntimeError(last_err or "未知请求错误")
+
+
+    # ---- 协议原语 ----
+
+    def _do_search(self, req: SearchRequest) -> dict:
+        """构造搜索请求体并 POST search_api 端点（spec 6.1 请求映射）。
+
+        query 原样透传（LLM 可使用搜索语法）；ori_question 仅在非 private
+        模式且非空时发送；localization 本期预留不发送。
+        """
+        payload = {
+            "query": req.query,
+            "count": req.count,
+            "need_content": req.need_content,
+        }
+        if req.ori_question:
+            payload["ori_question"] = req.ori_question
+        return self._post_json(self._search_url, payload)
+
+
+    def _do_fetch(self, url: str) -> dict:
+        """构造抓取请求体并 POST fetch_api 端点（spec 7.2）。"""
+        if not self._fetch_url:
+            raise WebApiError(0, "fetch 端点未配置（model_key.yaml web_search.fetch_api）")
+        return self._post_json(self._fetch_url, {"url": url})
+
+
+    # ---- 门面接口 ----
+
+    def search(self, req: SearchRequest) -> list:
+        data = self._do_search(req)
+        # 业务层错误：部分服务以 200 + error 字段返回
+        if isinstance(data, dict) and data.get("error"):
+            raise WebApiError(200, self._extract_error_message(_FakeJson(data)))
+        items = _extract_results_array(data)
+        return [_map_result_item(item) for item in items][: req.count]
+
+
+    def fetch(self, url: str) -> FetchResult:
+        data = self._do_fetch(url)
+        if isinstance(data, dict) and data.get("error"):
+            raise WebApiError(200, self._extract_error_message(_FakeJson(data)))
+        title = ""
+        markdown = ""
+        if isinstance(data, dict):
+            title = str(data.get("title") or "").strip()
+            # content 为确认字段；缺失时按 markdown / text 候选键兜底（schema 演进防御）
+            for key in ("content", "markdown", "text"):
+                val = data.get(key)
+                if isinstance(val, str) and val.strip():
+                    markdown = val
+                    break
+        if not markdown:
+            raise WebApiError(
+                200,
+                "fetch 响应解析失败：缺少 content/markdown/text 字段；"
+                f"原始响应前 500 字符: {str(data)[:500]}"
+            )
+        return FetchResult(url=url, title=title, markdown=markdown,
+                           fetched_at=datetime.now().isoformat(timespec="seconds"))
+
+
+class _FakeJson:
+    """让 _extract_error_message 复用于已解析的 dict（业务层 200 + error 场景）。"""
+
+    def __init__(self, data):
+        self._data = data
+
+    def json(self):
+        return self._data
+
+    @property
+    def text(self):
+        return str(self._data)
+
+
+# ======================== 响应归一化（spec 5.4，宽容解析） ========================
+
+def _extract_results_array(data) -> list:
+    """results 数组提取：候选路径依序探测，首个命中生效。
+
+    (1) data["results"]（DeepSeek 形态）
+    (2) data["data"]["webPages"]["value"]（bocha 形态，兼容预留）
+    (3) data["choices"][0]["message"]["web_search"]（zhipu 形态，兼容预留）
+    """
+    if not isinstance(data, dict):
+        return []
+    for getter in (
+        lambda d: d.get("results"),
+        lambda d: ((d.get("data") or {}).get("webPages") or {}).get("value"),
+        lambda d: ((d.get("choices") or [{}])[0].get("message") or {}).get("web_search"),
+    ):
+        try:
+            val = getter(data)
+        except (AttributeError, IndexError, TypeError):
+            continue
+        if isinstance(val, list):
+            return val
+    return []
+
+
+# 单条结果字段映射的候选键（首个非空命中）
+_FIELD_CANDIDATES = {
+    "title": ("title", "name"),
+    "url": ("url", "link"),
+    "snippet": ("snippet", "content"),
+    "summary": ("summary", "snippet"),
+    "content": ("content",),
+    "site_name": ("site_name", "siteName", "source"),
+    "site_icon": ("site_icon", "siteIcon", "favicon"),
+    "date": ("date", "publish_date", "publishedAt"),
+}
+
+
+def _map_result_item(item) -> SearchResult:
+    """单条结果归一化：候选键依序探测（首个非空命中），缺失容忍为空值。"""
+    if not isinstance(item, dict):
+        return SearchResult(title="", url="")
+
+    def pick(candidates):
+        for key in candidates:
+            val = item.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return None
+
+    authority = _to_int_safe(item.get("authority"))
+    rerank_raw = item.get("rerank_score")
+    if rerank_raw is None:
+        rerank_raw = item.get("score")
+    return SearchResult(
+        title=pick(_FIELD_CANDIDATES["title"]) or "",
+        url=pick(_FIELD_CANDIDATES["url"]) or "",
+        snippet=pick(_FIELD_CANDIDATES["snippet"]) or "",
+        summary=pick(_FIELD_CANDIDATES["summary"]) or "",
+        content=pick(_FIELD_CANDIDATES["content"]) or "",
+        site_name=pick(_FIELD_CANDIDATES["site_name"]),
+        site_icon=pick(_FIELD_CANDIDATES["site_icon"]),
+        date=pick(_FIELD_CANDIDATES["date"]),
+        authority=authority,
+        rerank_score=_to_float_safe(rerank_raw),
+    )
+
+
+_RESULT_FIELDS = ("title", "url", "snippet", "summary", "content",
+                  "site_name", "site_icon", "date", "authority", "rerank_score")
+
+
+def _result_to_dict(r: SearchResult) -> dict:
+    """SearchResult 全字段序列化（缓存条目，spec 5.5：不再只存三字段）。"""
+    return {f: getattr(r, f) for f in _RESULT_FIELDS}
+
+
+def _result_from_dict(d: dict) -> SearchResult:
+    return SearchResult(
+        title=str(d.get("title") or ""),
+        url=str(d.get("url") or ""),
+        snippet=str(d.get("snippet") or ""),
+        summary=str(d.get("summary") or ""),
+        content=str(d.get("content") or ""),
+        site_name=d.get("site_name"),
+        site_icon=d.get("site_icon"),
+        date=d.get("date"),
+        authority=d.get("authority"),
+        rerank_score=d.get("rerank_score"),
+    )
+
+
+def _fetch_result_to_dict(fr: FetchResult) -> dict:
+    return {"url": fr.url, "title": fr.title, "markdown": fr.markdown,
+            "fetched_at": fr.fetched_at}
+
+
+def _fetch_result_from_dict(d: dict) -> FetchResult:
+    return FetchResult(
+        url=str(d.get("url") or ""),
+        title=str(d.get("title") or ""),
+        markdown=str(d.get("markdown") or ""),
+        fetched_at=str(d.get("fetched_at") or ""),
+    )
 
 
 # ======================== 结果后处理与格式化 ========================
@@ -596,15 +764,14 @@ def _assess_relevance(results: list, core_terms: list):
 def _dedup(results: list) -> list:
     """按 URL 去重（忽略末尾斜杠与大小写）。
 
-    404 修复：URL 为空的结果（zhipu 部分查询不返回 link 字段）此前被
-    整条丢弃，导致"5 条 100% 相关结果 → 去重后 0 条"的静默丢失。
-    现改为：空 URL 结果保留（按标题去重），非空 URL 照常按 URL 去重。
+    空 URL 的结果保留（按标题去重），非空 URL 照常按 URL 去重——
+    防止"全部召回但无 url 字段"的结果被整条静默丢弃。
     """
     seen_urls = set()
     seen_titles = set()
     out = []
     for r in results:
-        url_key = r.url.rstrip("/").lower()
+        url_key = (r.url or "").rstrip("/").lower()
         if url_key:
             if url_key in seen_urls:
                 continue
@@ -619,226 +786,430 @@ def _dedup(results: list) -> list:
     return out
 
 
-def format_results(query: str, results: list, provider_name: str,
-                   token_budget: int, cached: bool,
-                   relevance_warning: str = "") -> str:
-    """将搜索结果格式化为编号列表，并按 token 预算截断。
+def _format_search_llm_text(query: str, results: list, provider_name: str,
+                            token_budget: int, cached: bool) -> tuple:
+    """将搜索结果格式化为编号列表并按 token 预算截断（spec 11 章）。
 
     token 估算：中文约 1 token ≈ 2 字符，按字符预算 = token_budget * 2 保守控制。
-    relevance_warning: 低相关警告文本（404 修复），非空时插入头部。
+    摘要优先用 summary（为模型而生的长摘要），缺失回退 snippet。
+
+    Returns:
+        (llm_text, 实际注入条数)——注入条数供双通道一致性标注使用。
     """
     if not results:
         return (
             f"搜索完成但未返回任何结果（后端: {provider_name}）。\n查询: {query}\n"
-            f"注意：该查询词在后端 {provider_name} 无召回（天气/实时类查询常见），"
-            f"可尝试换更具体的关键词；若换词后仍为空，请基于已有知识回答并声明未能联网获取实时数据。"
-        )
+            f"可尝试换更具体的关键词或使用搜索语法（site: / lang: / after: 等）；"
+            f"若换词后仍为空，请基于已有知识回答并声明未能联网获取实时数据。"
+        ), 0
     char_budget = max(500, token_budget * 2)
-    total = len(results)
     entries = []
     used = 0
     for i, r in enumerate(results, 1):
-        snippet = r.snippet or "（无摘要）"
-        if len(snippet) > 300:
-            snippet = snippet[:297] + "..."
-        entry = f"{i}. {r.title or '（无标题）'}\n   URL: {r.url}\n   摘要: {snippet}"
+        summary = r.summary or r.snippet or "（无摘要）"
+        meta_parts = []
+        if r.date:
+            meta_parts.append(f"日期: {r.date}")
+        if r.site_name:
+            meta_parts.append(f"站点: {r.site_name}")
+        if r.authority is not None and r.authority >= 0:
+            meta_parts.append(f"权威: {r.authority}/4")
+        if r.rerank_score is not None:
+            meta_parts.append(f"排序分: {r.rerank_score}")
+        entry = f"{i}. {r.title or '（无标题）'}\n   URL: {r.url}"
+        if meta_parts:
+            entry += "\n   " + " | ".join(meta_parts)
+        entry += f"\n   摘要: {summary}"
+        if r.content:
+            entry += f"\n   正文: {r.content}"
         if used + len(entry) > char_budget:
             break
         entries.append(entry)
         used += len(entry)
 
-    header = (
-        f"搜索结果（后端: {provider_name}{'，来自本地缓存' if cached else ''}），"
-        f"查询: {query}，共 {total} 条"
-    )
-    if len(entries) < total:
-        header += f"，因 token 预算仅展示前 {len(entries)} 条"
-    if relevance_warning:
-        header += "\n" + relevance_warning
-    return header + "\n\n" + "\n\n".join(entries)
+    header = (f'[web_search] 查询 "{query}"（后端 {provider_name}'
+              f'{"，来自本地缓存" if cached else ""}，{len(results)} 条）')
+    if len(entries) < len(results):
+        header += f"，因 token 预算仅注入前 {len(entries)} 条"
+    return header + ":\n\n" + "\n\n".join(entries), len(entries)
 
 
-# ======================== 模块级单例 ========================
-
-_cache_instance = None
-_rate_limiter_instance = None
-
-
-def _get_cache(cfg: WebSearchConfig) -> SearchCache:
-    global _cache_instance
-    if _cache_instance is None:
-        cache_path = Path(global_cfg.base_path.logs_root) / "web_search_cache.json"
-        _cache_instance = SearchCache(cache_path, cfg.cache_ttl)
-    return _cache_instance
+def _fetch_preview(markdown: str, max_lines: int = 3) -> str:
+    """抓取内容的首 N 行预览（每行截断 120 字符，供 CLI 面板展示）。"""
+    lines = [ln.strip() for ln in (markdown or "").splitlines() if ln.strip()]
+    return "\n".join(ln[:120] for ln in lines[:max_lines])
 
 
-def _get_rate_limiter(cfg: WebSearchConfig) -> RateLimiter:
-    global _rate_limiter_instance
-    if _rate_limiter_instance is None:
-        _rate_limiter_instance = RateLimiter(cfg.min_interval)
-    return _rate_limiter_instance
+# ======================== ori_question 附加（spec 9.4） ========================
+
+# 最近一条用户消息（query_loop 每 Query 开始时调用 set_last_user_input 更新）
+_last_user_input = ""
 
 
-# ======================== 工具入口 ========================
+def set_last_user_input(text: str):
+    """记录最近一条用户消息，供 ori_question 自动附加。"""
+    global _last_user_input
+    _last_user_input = (text or "").strip()
 
-def execute_web_search(params: dict) -> str:
-    """web_search 工具执行入口，供 tool_executor 调用。
+
+def _build_ori_question(cfg: WebSearchConfig) -> str:
+    """构造 ori_question（spec 9.4 附加策略）。
+
+    - auto / explicit 模式：附加最近一条用户消息（剥离 @ 引用/路径/标签噪声，
+      截断 128 字符）；附加前过隐私过滤，命中敏感内容则省略该字段
+      （不阻断搜索，因 query 本身已通过过滤）；
+    - private 模式：不附加（用户消息可能含项目细节，防止泄露）。
+    """
+    if cfg.trigger_mode == "private":
+        return ""
+    raw = _last_user_input
+    if not raw:
+        return ""
+    cleaned = re.sub(r'[A-Za-z]:[/\\][^\s，。,；;）)]*', ' ', raw)   # 盘符路径
+    cleaned = re.sub(r'@\S+', ' ', cleaned)                          # @ 引用
+    cleaned = re.sub(r'<[^>]+>', ' ', cleaned)                       # XML 标签
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    if not cleaned:
+        return ""
+    cleaned = cleaned[:128]
+    if check_query_privacy(cleaned, cfg.sensitive_words):
+        return ""
+    return cleaned
+
+
+# ======================== 双通道输出构造（spec 10.2 / 11 章） ========================
+
+def _search_display_results(results: list) -> list:
+    """display.results：CLI 展示字段（snippet 给人，spec 6.2 双通道分流）。"""
+    out = []
+    for r in results:
+        snippet = r.snippet or (r.summary[:200] if r.summary else "")
+        out.append({
+            "title": r.title,
+            "url": r.url,
+            "snippet": snippet,
+            "date": r.date,
+            "site_name": r.site_name,
+            "authority": r.authority,
+            "rerank_score": r.rerank_score,
+        })
+    return out
+
+
+def _search_output(cfg: WebSearchConfig, query: str, results: list, cached: bool) -> dict:
+    """搜索成功路径的双通道输出（llm_text 与 display 信息保持一致）。"""
+    llm_text, injected = _format_search_llm_text(
+        query, results, cfg.provider, cfg.token_budget, cached)
+    notices = []
+    if not results:
+        notices.append("无结果，建议换更具体的关键词或使用搜索语法（site: / lang: / after:）重试")
+    elif injected < len(results):
+        notices.append(f"因 token 预算仅注入前 {injected} 条")
+    display = {
+        "tool": "web_search",
+        "query_or_url": query,
+        "provider": cfg.provider,
+        "cached": cached,
+        "results": _search_display_results(results),
+        "notice": "；".join(notices),
+        "error": False,
+    }
+    return {"llm_text": llm_text, "display": display}
+
+
+def _fetch_output(cfg: WebSearchConfig, fr: FetchResult, cached: bool) -> dict:
+    """抓取成功路径的双通道输出：markdown 按 fetch_token_budget 首部截断（spec 7.4）。"""
+    char_budget = max(500, cfg.fetch_token_budget * 2)
+    full_chars = len(fr.markdown)
+    truncated = full_chars > char_budget
+    markdown = fr.markdown[:char_budget] if truncated else fr.markdown
+    title_part = f"{fr.title} | " if fr.title else ""
+    trunc_part = "，因预算截断" if truncated else ""
+    llm_text = (f"[web_fetch] {title_part}{fr.url}"
+                f"（Markdown {full_chars} 字符{trunc_part}）:\n{markdown}")
+    display = {
+        "tool": "web_fetch",
+        "query_or_url": fr.url,
+        "title": fr.title,
+        "provider": cfg.provider,
+        "cached": cached,
+        "char_count": full_chars,
+        "truncated": truncated,
+        "preview": _fetch_preview(markdown),
+        "notice": "内容因 token 预算截断，仅注入前部" if truncated else "",
+        "error": False,
+    }
+    return {"llm_text": llm_text, "display": display}
+
+
+def _status_display(tool: str, query_or_url: str, notice: str, error: bool = False) -> dict:
+    """失败/拦截路径的 display（notice 承载错误信息，spec 10.2 兼容要求）。"""
+    d = {
+        "tool": tool,
+        "query_or_url": query_or_url,
+        "provider": "",
+        "cached": False,
+        "results": [],
+        "notice": notice,
+        "error": error,
+    }
+    if tool == "web_fetch":
+        d.update({"title": "", "char_count": 0, "truncated": False, "preview": ""})
+    return d
+
+
+def _blocked_output(tool: str, query_or_url: str, notice: str) -> dict:
+    return {"llm_text": notice, "display": _status_display(tool, query_or_url, notice, error=True)}
+
+
+def _error_output(tool: str, query_or_url: str, notice: str) -> dict:
+    return {"llm_text": notice, "display": _status_display(tool, query_or_url, notice, error=True)}
+
+
+def _api_error_text(e: WebApiError, tool: str) -> str:
+    """将 API 错误转换为面向 LLM 的指令文本（spec 12 章错误矩阵）。"""
+    code = e.status_code
+    head = f"[ERROR] {tool} 执行失败: HTTP {code}" if code else f"[ERROR] {tool} 执行失败"
+    if code in (400, 413):
+        return (f"{head}（请求头或请求体不合法/超限）: {e.message}\n"
+                f"请修正参数（count 范围、url 约束等）后再调用，勿原样重试。")
+    if code == 401:
+        return (f"{head}（认证失败，Key 缺失或无效）: {e.message}\n"
+                f"请声明未能联网，勿立即重试；建议用户检查 model_key.yaml 密钥配置。")
+    if code == 402:
+        return (f"{head}（余额不足）: {e.message}\n"
+                f"请声明未能联网，勿立即重试；建议用户先充值后再试。")
+    if code == 403:
+        if tool == "web_fetch":
+            return (f"{head}（fetch 被安全策略拒绝）: {e.message}\n"
+                    f"请更换 URL，或改用 web_search 定位其他来源。")
+        return f"{head}: {e.message}\n请勿原样重试。"
+    if code == 404:
+        if tool == "web_fetch":
+            return (f"{head}（未能获取可用内容：URL 不可用/站点拦截/内容类型不受支持/无可提取正文）: {e.message}\n"
+                    f"请换 URL、用 web_search 定位其他来源，或声明该页不可读。")
+        return f"{head}: {e.message}\n请勿原样重试。"
+    return (f"{head}: {e.message}\n"
+            f"若重试仍失败，请基于已有知识回答并声明未能联网。")
+
+
+# ======================== 工具入口（tool_executor 调用） ========================
+
+def execute_web_search(params: dict) -> dict:
+    """web_search 工具执行入口（spec 10.2 双通道契约）。
 
     Args:
         params: {"query": str, "max_results": int(可选)}
 
     Returns:
-        格式化的结果文本（成功）或 [BLOCKED]/[ERROR] 提示（失败/未启用），
-        供包装为 {"role": "user", "content": "[web_search] ..."} 回注上下文。
+        {"llm_text": str, "display": dict}：llm_text 注入 LLM 上下文
+        （token 预算内），display 供 CLI 渲染；失败时同样返回该结构
+        （display.notice 承载错误信息，display.error=True）。
     """
-    query = str(params.get("query", "")).strip()
+    try:
+        return _execute_web_search_impl(params)
+    except Exception as e:  # noqa BLE001 兜底：任何异常不得中断 Query Loop
+        logger.error(f"web_search 未捕获异常: {e}")
+        return _error_output(
+            "web_search", str((params or {}).get("query", "")),
+            f"[ERROR] web_search 异常: {e}\n请基于已有知识回答，并明确告知用户本次未能联网搜索。")
+
+
+def _execute_web_search_impl(params: dict) -> dict:
+    query = str(params.get("query", "") or "").strip()
+    if not query:
+        return _error_output(
+            "web_search", "",
+            '[ERROR] web_search 缺少 query 参数。用法: <web_search query="搜索词" max_results="5"/>')
+
     try:
         max_results = int(params.get("max_results") or 0) or None
     except (TypeError, ValueError):
         max_results = None
 
-    if not query:
-        return ('[ERROR] web_search 缺少 query 参数。'
-                '用法: <web_search query="搜索词" max_results="5"/>')
-
     cfg = load_ws_config()
 
     # 功能开关检查
     if not cfg.enabled:
-        return (
+        return _blocked_output(
+            "web_search", query,
             "[BLOCKED] web_search 功能未启用（config.yaml 中 web_search.enabled 为 false）。"
-            "请基于已有知识回答，并向用户说明当前无法联网搜索。"
-        )
+            "请基于已有知识回答，并向用户说明当前无法联网搜索。")
 
-    # API Key 检查（duckduckgo 免 Key）
-    if cfg.provider != "duckduckgo" and not cfg.api_key:
-        return (
-            f"[BLOCKED] web_search 后端 '{cfg.provider}' 未配置 api_key"
-            f"（在 config/model_key.yaml 的 web_search.api_key 中填写）。"
-            f"请基于已有知识回答，并向用户说明无法联网搜索。"
-        )
+    # 旧形态检测：web_search 段缺 search_api → 功能视为未配置（spec 4.5）
+    if not cfg.search_api:
+        return _blocked_output(
+            "web_search", query,
+            "[BLOCKED] web_search 未配置搜索端点：model_key.yaml 的 web_search 段缺 search_api"
+            "（旧形态已停止支持）。请按新形态配置：\n"
+            "web_search:\n"
+            '  provider: "DeepSeek-main"    # 引用本文件中已定义的命名模型块\n'
+            '  search_api: "POST https://api.deepseek.com/v1/tools/search"\n'
+            '  fetch_api: "POST https://api.deepseek.com/v1/tools/fetch"\n'
+            "配置后重启生效。当前请基于已有知识回答，并向用户说明无法联网搜索。")
+
+    # provider 引用块解析（密钥三级查找由 config_loader 完成，此处校验引用有效性）
+    ok, err = _resolve_provider_ref(cfg)
+    if not ok:
+        return _blocked_output(
+            "web_search", query,
+            f"[BLOCKED] web_search {err}。请检查 model_key.yaml 中 web_search.provider 的引用配置，"
+            f"或基于已有知识回答并声明无法联网。")
 
     # 隐私硬过滤（代码级，优先于缓存与真实请求，所有模式生效）
     leak_reason = check_query_privacy(query, cfg.sensitive_words)
     if leak_reason:
-        return (
+        return _blocked_output(
+            "web_search", query,
             f"[BLOCKED] web_search 隐私过滤：query 含{leak_reason}，已拒绝执行。\n"
             f"请将问题改写为面向公网知识的通用描述（如 'Python 3.14 free-threading 稳定性'），"
-            f"严禁携带项目路径、文件名、函数名、密钥或内部报错细节，然后重新调用；或直接基于已有知识回答。"
-        )
+            f"严禁携带项目路径、文件名、函数名、密钥或内部报错细节，然后重新调用；"
+            f"或直接基于已有知识回答。")
 
-    if max_results is None:
-        max_results = cfg.max_results
-    max_results = max(1, min(max_results, 10))  # 钳制到 1~10
+    # 参数钳制：query 1~128 字符（超出截断），count 1~50
+    query = query[:128]
+    count = max_results if max_results is not None else cfg.max_results
+    count = max(1, min(count, 50))
 
-    # ===== 404 修复：提取查询核心实体词（相关性评估 + 低相关重查用） =====
-    core_terms = _extract_core_terms(query)
+    # 缓存命中：直接返回，不消耗配额（键含 need_content 维度）
+    cache = _get_search_cache(cfg)
+    cache_key = _search_cache_key(query, count, cfg.need_content)
+    cached_items = cache.get(cache_key)
+    if cached_items:
+        results = [_result_from_dict(item) for item in cached_items]
+        return _search_output(cfg, query, results, cached=True)
 
-    # 缓存命中：直接返回，不消耗配额
-    # （404 补充：缓存结果低相关时视为未命中——缓存的噪声结果会持续误导 LLM，
-    # 宁可重新搜索也不能让"DSH 不存在"这类错误结论在 TTL 内反复出现）
-    cache = _get_cache(cfg)
-    cached = cache.get(query, max_results)
-    if cached:
-        results = [SearchResult(
-            title=item.get("title", ""),
-            url=item.get("url", ""),
-            snippet=item.get("snippet", ""),
-        ) for item in cached]
-        ratio, rares = _assess_relevance(results, core_terms)
-        if not rares or ratio >= 0.5:
-            return format_results(query, results, cfg.provider, cfg.token_budget, cached=True)
-        logger.info(f"web_search 缓存命中但低相关({ratio:.0%})，忽略缓存重新搜索")
+    # 会话级调用上限（L2 硬守卫）
+    limit_hit, limit_notice = _check_session_limit("web_search", cfg)
+    if limit_hit:
+        return _blocked_output("web_search", query, limit_notice)
+
+    # 端点解析（配置声明驱动，spec 4.3）
+    try:
+        service = ToolsApiSearchService(cfg)
+    except ValueError as e:
+        return _error_output("web_search", query,
+                             f"[ERROR] web_search 端点配置解析失败: {e}")
+
+    req = SearchRequest(query=query, count=count,
+                        ori_question=_build_ori_question(cfg) or None,
+                        need_content=cfg.need_content)
 
     # 限流 + 真实请求
     try:
-        provider = create_provider(cfg)
         _get_rate_limiter(cfg).wait()
-        results = provider.search(query, max_results)
+        _session_call_counts["web_search"] += 1
+        results = service.search(req)
+    except WebApiError as e:
+        return _error_output("web_search", query, _api_error_text(e, "web_search"))
     except RuntimeError as e:
-        return (
-            f"[ERROR] web_search 执行失败: {e}\n"
-            f"请基于已有知识回答，并明确告知用户本次未能联网搜索，不要立即重试。"
-        )
-    except Exception as e:  # noqa BLE001 兜底：任何异常都不能中断 Query Loop
-        logger.error(f"web_search 未知异常: {e}")
-        return (
-            f"[ERROR] web_search 异常: {e}\n"
-            f"请基于已有知识回答，并明确告知用户本次未能联网搜索。"
-        )
-
-    # ===== 403 修复：主链路空结果时降级重查（仅 zhipu 后端） =====
-    # 实测：zhipu web-search-pro 独立接口对天气/实时类查询 0 召回（后端内容过滤），
-    # 但 chat completions + tools(web_search) 链路能返回实时数据。
-    # 空结果时自动降级重查一次，让"搜索不到"变成"能搜到"。
-    if not results and cfg.provider == "zhipu":
-        try:
-            fallback = ZhipuChatFallbackProvider(cfg)
-            _get_rate_limiter(cfg).wait()
-            fb_results = fallback.search(query, max_results)
-            if fb_results:
-                results = fb_results
-                logger.info(f"web_search 主链路空结果，降级链路召回 {len(fb_results)} 条: {query[:50]}")
-        except Exception as e:
-            logger.warning(f"web_search 降级链路失败（忽略，保持空结果提示）: {e}")
-
-    # ===== 404 修复：召回相关性评估 + 低相关自动重查/降级 =====
-    # 现场根因：查询含疑问后缀（"是什么"）时 zhipu 意图层改写失真
-    # （"Harness DSH"→"adhh"），召回大量无关结果，LLM 基于噪声错误断定
-    # "实体不存在"，甚至否定降级链路的真实回答（把真相当幻觉）。
-    # 对策：① 稀有词命中率评估相关性；② 低相关时用清洗词重查；
-    # ③ 仍低相关走 chat 降级；④ 最终仍低相关注入警告（禁止据此断言不存在）。
-    relevance_warning = ""
-    if results:
-        rel_ratio, rare_terms = _assess_relevance(results, core_terms)
-        if rare_terms and rel_ratio < 0.5:
-            # ① 清洗词重查（剥离疑问后缀，保留实体词）
-            cleaned_query = " ".join(core_terms)
-            if cleaned_query and cleaned_query != query:
-                try:
-                    _get_rate_limiter(cfg).wait()
-                    retry_results = provider.search(cleaned_query, max_results)
-                    retry_ratio, _ = _assess_relevance(retry_results, core_terms)
-                    if retry_ratio > rel_ratio:
-                        logger.info(
-                            f"web_search 低相关({rel_ratio:.0%})，清洗词重查提升至 {retry_ratio:.0%}: "
-                            f"{query[:40]} -> {cleaned_query[:40]}"
-                        )
-                        results = retry_results
-                        rel_ratio = retry_ratio
-                except Exception as e:
-                    logger.warning(f"web_search 清洗词重查失败: {e}")
-            # ② 仍低相关：chat 降级链路（仅 zhipu，真实联网回答）
-            if rel_ratio < 0.5 and cfg.provider == "zhipu":
-                try:
-                    fallback = ZhipuChatFallbackProvider(cfg)
-                    _get_rate_limiter(cfg).wait()
-                    fb_results = fallback.search(query, max_results)
-                    if fb_results:
-                        results = fb_results
-                        rel_ratio = 1.0  # 联网回答直接针对查询，视为相关
-                        logger.info(f"web_search 低相关走降级链路: {query[:50]}")
-                except Exception as e:
-                    logger.warning(f"web_search 相关性降级链路失败: {e}")
-            # ③ 最终仍低相关：注入警告，防止 LLM 据噪声断言实体不存在
-            if rel_ratio < 0.5:
-                relevance_warning = (
-                    f"⚠️ 相关性警告：仅 {rel_ratio:.0%} 的结果含核心实体词"
-                    f"（{'/'.join(rare_terms)}），查询疑似被后端意图改写失真。"
-                    f"严禁据此断定该实体/技术不存在——请换关键词（纯实体名、去疑问后缀）重查，"
-                    f"或基于已有知识回答并声明搜索召回异常。"
-                )
+        return _error_output(
+            "web_search", query,
+            f"[ERROR] web_search 执行失败（已重试 {cfg.max_retries} 次）: {e}\n"
+            f"请基于已有知识回答，并明确告知用户本次未能联网搜索，不要立即重试。")
+    except Exception as e:  # noqa BLE001 兜底
+        logger.error(f"web_search 执行异常: {e}")
+        return _error_output(
+            "web_search", query,
+            f"[ERROR] web_search 异常: {e}\n请基于已有知识回答，并明确告知用户本次未能联网搜索。")
 
     results = _dedup(results)
-    # 空结果不写缓存：天气/实时类查询常出现后端无召回（非稳定结果），
-    # 若缓存空结果，后续同查询在 TTL 内会直接命中空缓存，掩盖换词重试的效果。
-    # 低相关结果同样不写缓存（404）：噪声结果缓存后会在 TTL 内反复误导 LLM。
-    if results and not relevance_warning:
-        cache.put(query, max_results, results)
-    # 降级链路召回时标注来源，便于 LLM 区分数据来源（搜索结果 vs 联网回答）
-    provider_label = cfg.provider
-    if results and cfg.provider == "zhipu" and any(
-            r.title.startswith("[zhipu 联网回答]") for r in results):
-        provider_label = "zhipu_chat（降级链路：联网回答）"
-    return format_results(query, results, provider_label, cfg.token_budget,
-                          cached=False, relevance_warning=relevance_warning)
+    # 空结果不写缓存：换词重试不被 TTL 内的空缓存掩盖（沿用既有策略）
+    if results:
+        cache.put(cache_key, [_result_to_dict(r) for r in results])
+    return _search_output(cfg, query, results, cached=False)
+
+
+def execute_web_fetch(params: dict) -> dict:
+    """web_fetch 工具执行入口（spec 7 章 / 10.2 双通道契约）。
+
+    Args:
+        params: {"url": str}
+
+    Returns:
+        {"llm_text": str, "display": dict}：markdown 按 fetch_token_budget
+        首部截断并明确标注；失败时 display.notice 承载错误信息。
+    """
+    try:
+        return _execute_web_fetch_impl(params)
+    except Exception as e:  # noqa BLE001 兜底：任何异常不得中断 Query Loop
+        logger.error(f"web_fetch 未捕获异常: {e}")
+        return _error_output(
+            "web_fetch", str((params or {}).get("url", "")),
+            f"[ERROR] web_fetch 异常: {e}\n请换 URL 重试，或声明该页不可读。")
+
+
+def _execute_web_fetch_impl(params: dict) -> dict:
+    url = str(params.get("url", "") or "").strip()
+    if not url:
+        return _error_output(
+            "web_fetch", "",
+            '[ERROR] web_fetch 缺少 url 参数。用法: <web_fetch url="https://example.com/docs"/>')
+
+    cfg = load_ws_config()
+
+    if not cfg.enabled:
+        return _blocked_output(
+            "web_fetch", url,
+            "[BLOCKED] web_search 功能未启用（config.yaml 中 web_search.enabled 为 false）。"
+            "请基于已有知识回答。")
+
+    # fetch_api 选填：缺失时仅禁用 web_fetch，不影响 web_search（spec 4.2）
+    if not cfg.fetch_api:
+        return _blocked_output(
+            "web_fetch", url,
+            "[BLOCKED] web_fetch 未配置抓取端点：model_key.yaml 的 web_search 段缺 fetch_api"
+            "（选填项，缺失时仅禁用 web_fetch，不影响 web_search）。")
+
+    ok, err = _resolve_provider_ref(cfg)
+    if not ok:
+        return _blocked_output(
+            "web_fetch", url,
+            f"[BLOCKED] web_fetch {err}。请检查 model_key.yaml 中 web_search.provider 的引用配置。")
+
+    # URL 安全校验（spec 7.3，代码级硬约束）
+    deny = _check_fetch_url(url, cfg.sensitive_words)
+    if deny:
+        return _blocked_output(
+            "web_fetch", url,
+            f"[BLOCKED] web_fetch URL 安全校验未通过：{deny}。\n"
+            f"请更换合规的公网 URL，或改用 web_search 定位来源。")
+
+    # 缓存命中（按 URL 为键，TTL 同 cache_ttl）
+    cache = _get_fetch_cache(cfg)
+    cache_key = _fetch_cache_key(url)
+    cached_entry = cache.get(cache_key)
+    if cached_entry:
+        fr = _fetch_result_from_dict(cached_entry)
+        return _fetch_output(cfg, fr, cached=True)
+
+    # 会话级调用上限
+    limit_hit, limit_notice = _check_session_limit("web_fetch", cfg)
+    if limit_hit:
+        return _blocked_output("web_fetch", url, limit_notice)
+
+    try:
+        service = ToolsApiSearchService(cfg)
+    except ValueError as e:
+        return _error_output("web_fetch", url, f"[ERROR] web_fetch 端点配置解析失败: {e}")
+
+    try:
+        _get_rate_limiter(cfg).wait()
+        _session_call_counts["web_fetch"] += 1
+        fr = service.fetch(url)
+    except WebApiError as e:
+        return _error_output("web_fetch", url, _api_error_text(e, "web_fetch"))
+    except RuntimeError as e:
+        return _error_output(
+            "web_fetch", url,
+            f"[ERROR] web_fetch 执行失败（已重试 {cfg.max_retries} 次）: {e}\n"
+            f"请换 URL 重试，或基于已有知识回答并声明该页不可读。")
+    except Exception as e:  # noqa BLE001 兜底
+        logger.error(f"web_fetch 执行异常: {e}")
+        return _error_output(
+            "web_fetch", url,
+            f"[ERROR] web_fetch 异常: {e}\n请换 URL 重试，或声明该页不可读。")
+
+    # 全量缓存（截断只发生在注入层，预算调大后缓存仍可提供全文）
+    cache.put(cache_key, _fetch_result_to_dict(fr))
+    return _fetch_output(cfg, fr, cached=False)

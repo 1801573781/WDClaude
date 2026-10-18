@@ -52,16 +52,52 @@ api_constraints:
 log:
   format: "html"   # 可选 "md" 或 "html"
 
-# 互联网搜索工具配置（参数类；密钥在 model_key.yaml 的 web_search 段）
+# 互联网搜索工具配置（参数类；密钥与端点在 model_key.yaml 的 web_search 段，
+# 新形态见 spec/web_search_refactor_spec.md 第 4 章）
 web_search:
-  enabled: true          # 功能总开关（true=启用联网搜索）
-  trigger_mode: private  # 触发模式: auto=LLM自主 / explicit=仅用户明确要求 / private=自主但query仅限通用词汇
-  sensitive_words: []    # 额外受保护词汇（query命中即拒绝），如 ["MyClaude", "某内部项目名"]
-  max_results: 5          # 默认返回条数
-  timeout: 10             # HTTP 超时（秒）
-  max_retries: 2          # 失败重试次数（指数退避）
-  cache_ttl: 3600         # 搜索结果本地缓存有效期（秒），0 为禁用缓存
-  token_budget: 3000      # 单次结果注入的 token 预算
-  min_interval: 2.0       # 两次真实搜索的最小间隔（秒），防止刷配额
-  fallback_model: "glm-4-flash"  # zhipu 降级链路 chat 模型（主搜索接口无召回时自动降级，403修复）
-  fallback_max_results: 5        # 降级链路最多提取的结果条数
+  enabled: true              # 功能总开关（true=启用联网搜索）
+  trigger_mode: private      # 触发模式: auto=LLM自主 / explicit=仅用户明确要求 / private=自主但query仅限通用词汇
+  sensitive_words: []        # 受保护词汇（query/URL 命中即拒绝），如 ["某内部项目名"]
+  max_results: 5             # 默认返回条数（映射 API count，钳制 1~50）
+  need_content: false        # 是否随搜索返回网页正文 content（默认关，深读走 web_fetch）
+  timeout: 10                # HTTP 超时（秒），search 与 fetch 共用
+  max_retries: 2             # 失败重试次数（指数退避）
+  cache_ttl: 3600            # 缓存有效期（秒），0 禁用；search 与 fetch 独立缓存
+  token_budget: 3000         # 单次搜索结果注入 token 预算
+  fetch_token_budget: 3000   # 单次抓取内容注入 token 预算
+  min_interval: 2.0          # 两次真实请求（search/fetch 合计）最小间隔（秒）
+  max_calls_per_session: 10  # 会话级调用上限（search 与 fetch 分别计数），0 = 不限
+
+# 视觉/多模态配置（spec/multimodal_spec.md 10.1）
+vision:
+  enabled: true                    # 总开关；false 时 media_input 引用不触发视觉提取，按 operation_target 处理
+  max_images_per_request: 50        # 单次输入图像数上限，超出 fail-fast 终止会话（提示分批提供）
+  max_long_edge_px: 1500           # 预处理最长边压缩上限（LANCZOS）
+  detail: auto                     # OpenAI 兼容接口透传参数: low / high / auto
+  zoom_min_edge: 1024              # 特写上采样最短边
+  view_image_max_zoom: 50           # 会话级特写次数上限（熔断）
+  view_image_token_budget: 50000   # 会话级视觉旁路 token 预算（熔断）
+  intent_classify_enabled: true    # L1 意图判断开关；false 回退旧行为（候选引用一律按需求文档预读）
+
+# 媒体 Handler 装配表（配置驱动，D10；importlib 动态加载，spec 10.1）
+media:
+  handlers:
+    image:
+      enabled: true
+      handler_class: "src.wdclaude.vision.handlers.image_handler.ImageHandler"
+      extensions: [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"]   # 扩展名归类清单，增删格式只改配置
+    # video:                       # 预留（Phase 4），本次不启用
+    #   enabled: false
+    #   handler_class: "src.wdclaude.vision.handlers.video_handler.VideoHandler"
+    #   extensions: [".mp4", ".mov", ".avi", ".mkv"]
+    # audio:                       # 预留（Phase 4），本次不启用
+    #   enabled: false
+    #   handler_class: "src.wdclaude.vision.handlers.audio_handler.AudioHandler"
+    #   extensions: [".mp3", ".wav", ".flac", ".m4a"]
+
+# 多模态注入模式（spec/multimodal_spec.md 第 5 章）
+multimodal:
+  mode: cascade                    # cascade(默认,A+B级联) | native(单一多模态,仅显式 opt-in)
+  image_lifetime_rounds: -1        # native 模式策略性降级轮数，-1 永不
+  image_evict_on_context_pressure: true   # 生存性降级（不受 -1 豁免）
+  image_cache_aware: false         # 缓存感知保留（预留）

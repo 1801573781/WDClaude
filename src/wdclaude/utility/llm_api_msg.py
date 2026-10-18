@@ -417,3 +417,23 @@ class LLMAPIMessage:
     # 这是一个内部的简化实现
     def _append_info(self, msg):
         self.api_messages.append(msg)
+
+    def insert_before_last_user(self, content):
+        """在最后一条 user 消息之前插入一条 user 消息（视觉 B 注入用，multimodal_spec 4.7）。
+
+        消息顺序契约：会话级说明 -> B（视觉提取） -> A（用户原始输入）。
+        A 已通过 init_api_msg append 为末尾 user 消息；调用方按
+        "先插说明、再插 B" 的顺序调用两次本方法，即可得到
+        [说明, B, A] 的正确排布（每次插入都落在当前最后一条 user 之前）。
+        找不到 user 消息时降级为普通 append。
+        """
+        insert_at = None
+        for i in range(len(self.api_messages) - 1, -1, -1):
+            if self.api_messages[i].get("role") == "user":
+                insert_at = i
+                break
+        msg = {"role": "user", "content": content}
+        if insert_at is None:
+            self._append_info(msg)
+        else:
+            self.api_messages.insert(insert_at, msg)

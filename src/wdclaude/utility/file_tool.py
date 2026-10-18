@@ -20,6 +20,21 @@ def _read_text_safe(file_path: Path) -> str:
     )
 
 
+def read_file(path: str, fallback: str = "") -> str:
+    """按路径读取文本文件（公开接口，供 query_loop 需求文档预读等模块使用）。
+
+    - 推荐传绝对路径；文件不存在/是目录/编码读取失败时返回 fallback，不抛异常
+    - 内部复用 _read_text_safe 的多编码兜底链
+    """
+    try:
+        p = Path(path)
+        if not p.is_file():
+            return fallback
+        return _read_text_safe(p)
+    except (OSError, UnicodeDecodeError, LookupError, ValueError):
+        return fallback
+
+
 # LLM 可能输出占位符作为路径（如"绝对路径"、"命令"等），这些不是合法路径，必须拒绝
 _INVALID_PATH_TOKENS = [
     "绝对路径", "项目代码目录", "项目需求目录", "{项目代码目录}",

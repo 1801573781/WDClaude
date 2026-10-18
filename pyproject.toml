@@ -9,6 +9,7 @@ dependencies = [
     "openai>=1.0",
     "rich>=13.0",
     "pyyaml>=6.0",
+    "Pillow>=10.0",
 ]
 
 # 可选依赖组：按需安装，安装后 wdclaude doctor 会检测提示
@@ -35,4 +36,5 @@ wdclaude = [
     "defaults/**/*.tpl",
     "defaults/roles/**/*.md",
     "skills/**/SKILL.md",
+    "vision/prompts/*.txt",
 ]

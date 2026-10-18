@@ -434,10 +434,60 @@ def print_user_input(content: str):
                  f'</div></div>')
 
 
-def print_welcome():
-    """打印欢迎信息"""
+# 内置命令清单（欢迎页 Commands 区的单一数据源）
+# 新增/修改内置命令（mycli.handle_command 硬编码处理的命令）只需在此追加一行，
+# 欢迎页与 /help 自动同步；.wdclaude/commands/ 下注册的斜杠命令由
+# print_welcome(registry) 动态追加，新增命令 .md 文件后自动出现在欢迎页。
+BUILTIN_COMMANDS = [
+    ("`/cls`", "Clear Screen"),
+    ("`/help`", "Show this help message"),
+    ("`/tokens`", "Show the tokens statistics"),
+    ("`/t number`", "展开指定 Turn 的思考过程"),
+    ("`/new session`", "开启新 Session（清空上下文 + 清空记忆 + 新日志文件）"),
+    ("`/mem`", "memory相关命令，输入 /mem 查看命令列表"),
+    ("`/bug`", "bug base相关命令，输入 /bug 查看命令列表"),
+    ("`/init [--proj_root <路径>]`", "创建WDClaude的项目工程树（--proj_root 指定项目根目录，不指定则为当前目录）"),
+    ("`/init [--proj_root <路径>] file`", "创建函数级摘要 (简写 /init f)"),
+    ("`/proj_root`", "显示当前 Project Root（未设置时提示使用 /init 设置）"),
+    ("`/cs [<目录>]`", "统计项目代码行数（无参数统计项目根目录；绝对路径直接使用；相对路径以项目根目录为父目录）"),
+    ("`/test`", "单元测试和系统测试，/test --help 显示test命令帮助信息"),
+    ("`/opsx`", "openspec相关命令，输入 /opsx 查看命令列表"),
+    ("`/h2m <p1> <p2> [<p3>] [<p4>]`", "将 Session Log HTML 转换为 Markdown（参数值含空格请用引号）"),
+    ("`/save <filename> [all]`", "Save last interaction (or all with \"all\" flag) to HTML file"),
+    ("`/ss <filename>`", "保存屏幕输出存档（后缀 .html/.md；仅文件名时存于 .wdclaude/tmp_output）"),
+    ("`/quit` or `/exit`", "Exit the application"),
+]
 
-    welcome_text = """
+
+def _build_welcome_text(registry=None) -> str:
+    """构建欢迎页 Markdown 文本（内置命令 + 动态扫描的注册命令）。
+
+    Args:
+        registry: 命令注册表（可选）。传入时在 Commands 区后追加
+            Custom Commands 小节，列出 .wdclaude/commands/ 下扫描到的
+            斜杠命令及其 Front Matter 描述。
+    """
+    commands_md = "\n".join(f"- {cmd} - {desc}" for cmd, desc in BUILTIN_COMMANDS)
+
+    custom_lines = []
+    if registry is not None:
+        try:
+            commands = sorted(registry.list_commands(), key=lambda c: c.command_name)
+        except Exception:
+            commands = []
+        for cmd in commands:
+            desc = (cmd.description or "").strip() or "（无描述，详见命令文件）"
+            if len(desc) > 60:
+                desc = desc[:60] + "..."
+            custom_lines.append(f"- `{cmd.command_name}` - {desc}")
+
+    if custom_lines:
+        custom_section = ("\n## Custom Commands (auto-scanned from .wdclaude/commands/)\n"
+                          + "\n".join(custom_lines) + "\n")
+    else:
+        custom_section = ""
+
+    return f"""
 # 🤖 WDClaude Code CLI
 
 Welcome to WDClaude Code CLI! A beautiful terminal interface for AI Coding.
@@ -452,27 +502,23 @@ Welcome to WDClaude Code CLI! A beautiful terminal interface for AI Coding.
 - 📋 Copy messages to clipboard
 
 ## Commands
-- `/cls` - Clear Screen
-- `/help` - Show this help message
-- `/tokens` - Show the tokens statistics
-- `/t number` - 展开指定 Turn 的思考过程
-- `/new session` - 开启新 Session（清空上下文 + 清空记忆 + 新日志文件）
-- `/mem` - memory相关命令，输入 /mem 查看命令列表
-- `/bug` - bug base相关命令，输入 /bug 查看命令列表
-- `/init [--proj_root <路径>]` - 创建WDClaude的项目工程树（--proj_root 指定项目根目录，不指定则为当前目录）
-- `/init [--proj_root <路径>] file` - 创建函数级摘要 (简写 /init f)
-- `/proj_root` - 显示当前 Project Root（未设置时提示使用 /init 设置）
-- `/cs [<目录>]` - 统计项目代码行数（无参数统计项目根目录；绝对路径直接使用；相对路径以项目根目录为父目录）
-- `/test` - 单元测试和系统测试，/test --help 显示test命令帮助信息
-- `/opsx` - openspec相关命令，输入 /opsx 查看命令列表
-- `/h2m <p1> <p2> [<p3>] [<p4>]` - 将 Session Log HTML 转换为 Markdown（参数值含空格请用引号）
-- `/save <filename> [all]` - Save last interaction (or all with "all" flag) to HTML file
-- `/quit` or `/exit` - Exit the application
-
+{commands_md}
+{custom_section}
 ---
 
 *Start typing to begin your conversation!*
 """
+
+
+def print_welcome(registry=None):
+    """打印欢迎信息
+
+    Args:
+        registry: 命令注册表（可选）。传入时自动追加 .wdclaude/commands/
+            下注册的斜杠命令——新增命令文件后无需手工维护欢迎页，
+            重启即自动显示。
+    """
+    welcome_text = _build_welcome_text(registry)
 
     console.print(Panel(
         Markdown(welcome_text),
@@ -895,6 +941,175 @@ def typewriter_then_collapse(text: str, turn: int, delay: float = 0.003):
                  f'</pre></details>')
 
 
+def _fmt_score(v) -> str:
+    """格式化排序分（保留 1 位小数）。"""
+    try:
+        return f"{float(v):.1f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def print_web_display(display: dict):
+    """渲染 web_search / web_fetch 的 display 结构（Rich 面板，spec 10.3/10.4）。
+
+    忠实呈现：成功、空结果、缓存命中、失败/被拦截全部如实展示；
+    可溯源：每条信息的来源 URL 对用户可见；不在终端刷屏全文（fetch 仅预览）。
+
+    Args:
+        display: 工具入口返回的 display dict
+                （tool/query_or_url/provider/cached/results/notice/error 等）
+    """
+    if not isinstance(display, dict):
+        return
+    tool = display.get("tool", "web_search")
+    query_or_url = str(display.get("query_or_url", ""))
+    provider = str(display.get("provider", ""))
+    cached = bool(display.get("cached"))
+    notice = str(display.get("notice", ""))
+    is_error = bool(display.get("error"))
+
+    # 错误/拦截：红色提示面板（含 notice 承载的错误信息）
+    if is_error or (notice and not display.get("results")):
+        console.print(Panel(
+            Text(_sanitize_ambiguous_width(notice or "未知错误")),
+            title=f"[bold red]🌐 {escape(tool)}[/bold red]",
+            border_style="red",
+            padding=(0, 1),
+        ))
+        _append_html(
+            f'<div style="margin:8px 0; border:1px solid #ef4444; border-radius:4px; padding:8px;">'
+            f'<div style="color:#ef4444; font-weight:bold;">🌐 {html_escape(tool)}</div>'
+            f'<div style="color:#e2e8f0;">{html_escape(notice)}</div></div>'
+        )
+        return
+
+    if tool == "web_fetch":
+        # ---- web_fetch 面板（spec 10.4）：URL + 标题 + 摘要信息 + 预览 ----
+        title = str(display.get("title", ""))
+        char_count = display.get("char_count", 0)
+        truncated = bool(display.get("truncated"))
+        preview = str(display.get("preview", ""))
+        header_lines = [f"URL: {query_or_url}"]
+        if title:
+            header_lines.append(f"标题: {title}")
+        status_parts = ["成功"]
+        if cached:
+            status_parts.append("缓存命中")
+        status_parts.append(f"Markdown {char_count:,} 字符")
+        if truncated:
+            status_parts.append("注入截断至预算内")
+        header_lines.append(" | ".join(status_parts))
+        body = "\n".join(header_lines)
+        if preview:
+            body += "\n\n" + _sanitize_ambiguous_width(preview)
+        if notice:
+            body += f"\n\n{notice}"
+        console.print(Panel(
+            Text(body),
+            title="[bold bright_cyan]🌐 web_fetch[/bold bright_cyan]",
+            border_style="bright_cyan",
+            padding=(0, 1),
+        ))
+        _append_html(
+            f'<div style="margin:8px 0; border:1px solid #22d3ee; border-radius:4px; padding:8px;">'
+            f'<div style="color:#22d3ee; font-weight:bold;">🌐 web_fetch</div>'
+            f'<div>URL: {html_escape(query_or_url)}</div>'
+            + (f'<div>标题: {html_escape(title)}</div>' if title else "")
+            + f'<div>{" | ".join(html_escape(p) for p in status_parts)}</div>'
+            + (f'<pre style="white-space:pre-wrap; font-family:inherit;">{html_escape(preview)}</pre>' if preview else "")
+            + '</div>'
+        )
+        return
+
+    # ---- web_search 面板（spec 10.3）：查询头 + 编号结果列表 ----
+    results = display.get("results") or []
+    header_lines = [f"查询: {_sanitize_ambiguous_width(query_or_url)}"]
+    info_parts = []
+    if provider:
+        info_parts.append(provider)
+    if results:
+        info_parts.append(f"{len(results)} 条")
+    if cached:
+        info_parts.append("缓存命中")
+    if info_parts:
+        header_lines.append("后端: " + " | ".join(info_parts))
+    if not results and notice:
+        header_lines.append(notice)
+
+    body_lines = ["\n".join(header_lines)]
+    for i, r in enumerate(results, 1):
+        r_title = str(r.get("title", "") or "（无标题）")
+        r_url = str(r.get("url", ""))
+        r_snippet = str(r.get("snippet", ""))
+        r_date = r.get("date")
+        r_site = r.get("site_name")
+        r_auth = r.get("authority")
+        r_score = r.get("rerank_score")
+        # 元信息行：站点 + 权威 N/4（authority 为 -1 或缺失省略）+ 排序分（缺失省略）
+        meta_parts = []
+        if r_site:
+            meta_parts.append(str(r_site))
+        if isinstance(r_auth, int) and r_auth >= 0:
+            meta_parts.append(f"权威 {r_auth}/4")
+        if r_score is not None:
+            meta_parts.append(f"排序分 {_fmt_score(r_score)}")
+        lines = [f"{i}. [bold]{escape(_sanitize_ambiguous_width(r_title))}[/bold]"
+                 + (f"    [dim]{escape(str(r_date))}[/dim]" if r_date else "")]
+        if r_url:
+            lines.append(f"   [dim]{escape(r_url)}[/dim]")
+        if meta_parts:
+            lines.append(f"   [dim]{' | '.join(escape(p) for p in meta_parts)}[/dim]")
+        if r_snippet:
+            lines.append(f"   {escape(_sanitize_ambiguous_width(r_snippet))}")
+        body_lines.append("\n".join(lines))
+    if notice and results:
+        body_lines.append(f"[yellow]{escape(notice)}[/yellow]")
+
+    console.print(Panel(
+        Text.from_markup("\n\n".join(body_lines)),
+        title="[bold bright_cyan]🌐 web_search[/bold bright_cyan]",
+        border_style="bright_cyan",
+        padding=(0, 1),
+    ))
+
+    # HTML 缓冲区（纯文本存档）
+    html_lines = [
+        f'<div style="margin:8px 0; border:1px solid #22d3ee; border-radius:4px; padding:8px;">',
+        f'<div style="color:#22d3ee; font-weight:bold;">🌐 web_search</div>',
+        f'<div>查询: {html_escape(query_or_url)}</div>',
+        f'<div>后端: {html_escape(" | ".join(info_parts))}</div>',
+    ]
+    for i, r in enumerate(results, 1):
+        html_lines.append(
+            f'<div style="margin:6px 0 0 12px;">'
+            f'<div><b>{i}. {html_escape(str(r.get("title", "")))}</b>'
+            + (f' <span style="color:#888;">{html_escape(str(r.get("date")))}</span>' if r.get("date") else "")
+            + '</div>'
+            + (f'<div style="color:#22d3ee;">{html_escape(str(r.get("url", "")))}</div>' if r.get("url") else "")
+            + (f'<div style="color:#888;">{html_escape(" | ".join(_fetch_meta_parts(r)))}</div>' if _fetch_meta_parts(r) else "")
+            + (f'<div>{html_escape(str(r.get("snippet", "")))}</div>' if r.get("snippet") else "")
+            + '</div>'
+        )
+    if notice:
+        html_lines.append(f'<div style="color:#eab308;">{html_escape(notice)}</div>')
+    html_lines.append('</div>')
+    _append_html("".join(html_lines))
+
+
+def _fetch_meta_parts(r: dict) -> list:
+    """构造单条结果的元信息片段（site_name / 权威 / 排序分），供 HTML 存档复用。"""
+    parts = []
+    if r.get("site_name"):
+        parts.append(str(r["site_name"]))
+    auth = r.get("authority")
+    if isinstance(auth, int) and auth >= 0:
+        parts.append(f"权威 {auth}/4")
+    score = r.get("rerank_score")
+    if score is not None:
+        parts.append(f"排序分 {_fmt_score(score)}")
+    return parts
+
+
 def print_tool_call(tool_name: str, params: dict):
     """打印工具调用预告，根据工具类型显示关键参数"""
     if tool_name == "bash":
@@ -917,6 +1132,8 @@ def print_tool_call(tool_name: str, params: dict):
         query = params.get("query", "")
         max_results = params.get("max_results")
         detail = f"{query}（max_results={max_results}）" if max_results is not None else query
+    elif tool_name == "web_fetch":
+        detail = params.get("url", "")
     else:
         detail = params.get("path", "")
 
@@ -1017,9 +1234,10 @@ def print_tool_result(tool_name: str, content: str, params: dict | None = None):
         console.print()
         return
 
-    # 对于 web_search，只打印结果首行（后端/查询/条数摘要），完整结果注入 LLM 上下文
+    # 对于 web_search / web_fetch：display 面板已由渲染回调输出（双通道分离，
+    # spec 10.2），此处不重复打印内容，仅输出确认行
     # [BLOCKED]/[ERROR] 提示较短，走正常打印路径完整展示
-    if tool_name == "web_search" and not content.startswith(("[BLOCKED]", "[ERROR]")):
+    if tool_name in ("web_search", "web_fetch") and not content.startswith(("[BLOCKED]", "[ERROR]")):
         first_line = content.split("\n", 1)[0]
         console.print(f"    [bright_green]✓[/bright_green] {escape(first_line)}，详细内容略", markup=True)
         _append_html(f'<p style="margin:4px 0 4px 40px; color:#4ade80;">✓ {html_escape(first_line)}，详细内容略</p>')

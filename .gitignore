@@ -22,9 +22,16 @@ build/
 .wdclaude/init/
 .wdclaude/data/
 .wdclaude/logo/
+.wdclaude/media/
 .wdclaude/settings.local.json
 .wdclaude/config/model_key.yaml
 .wdclaude/skills/openspec-*/
+
+# ===== 需求规格目录（本地私有需求文档，不入 git）=====
+spec/
+
+# ===== 临时问题单目录（反馈截图/问题记录，仅本地使用，不入 git）=====
+problem/
 
 # ===== 跨语言通用噪声（无前导斜杠，对任意层级生效，含嵌套子项目如 wdbuddy）=====
 node_modules/

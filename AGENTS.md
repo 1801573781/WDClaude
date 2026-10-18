@@ -11,8 +11,8 @@
 ## Config（两级 + 环境变量，v2.0 第 6 章）
 
 优先级：环境变量 > B/.wdclaude/config > 包内 defaults
-- `B/.wdclaude/config/config.yaml` — 唯一活跃配置
-- `B/.wdclaude/config/model_key.yaml` — API 密钥（provider 顶层节 + main_model.provider 引用；密钥红线，不入 git）
+- `B/.wdclaude/config/config.yaml` — 唯一活跃配置（web_search 参数段：trigger_mode / sensitive_words / 预算 / 限流 / 会话上限等）
+- `B/.wdclaude/config/model_key.yaml` — API 密钥（provider 顶层节 + main_model.provider 引用；web_search 段为 `provider 引用 + search_api / fetch_api 端点声明`；密钥红线，不入 git）
 - 密钥三级查找：WDCLAUDE_API_KEY env → B 级 model_key.yaml → ~/.wdclaude/model_key.yaml 兜底
 - `B/.wdclaude/config/memory/memory_ex.yaml` — 记忆后端配置
 - All config merged into `SimpleNamespace` at `global_cfg = load_config()`（`wdclaude/utility/config_loader.py`）
@@ -41,14 +41,7 @@
 
 ## LLM Tool Protocol (XML-based)
 
-Tools parsed from LLM output via regex in `wdclaude/llm_tool/tool_executor.py`:
-- `<file_view path="..." limit="N" offset="N"/>`
-- `<create path="..." summary="...">content</create>`
-- `<str_replace path="..." summary="..."><old>...</old><new>...</new></str_replace>`
-- `<bash>command</bash>`
-- `<use_skill name="..."/>`
-- `<web_search query="..." max_results="N"/>`
-- `<done>summary</done>`
+...
 
 ## Critical Rules (from sys_prompt)
 

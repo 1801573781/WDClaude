@@ -75,8 +75,19 @@ class QueryLoop:
         self._last_todo_sig = None  # 死循环熔断：上一轮 todo 状态签名
 
         # 延迟记忆召回：当用户输入引用了文件时，推迟到文件读取后再召回
+        # （仅 L1 不可用/回退模式使用；正常模式下由 L0/L1 分流取代，multimodal_spec 3.1）
         self._pending_memory_recall = False
         self._current_user_input = ""
+
+        # ===== L0/L1 输入分流（multimodal_spec 3.1，惰性装配，零侵入）=====
+        # 媒体注册表（media.handlers 配置驱动 D10）：None=未装配，装配失败置 _vision_registry_failed
+        self._vision_registry = None
+        self._vision_registry_failed = False
+        # 会话级视觉能力说明是否已注入（4.6，仅首次多模态注入一次）
+        self._vision_notice_injected = False
+        # 输入分流 fail-fast 标志：现仅 view_image 工具级致命错误置位；
+        # L1 意图分类与视觉提取失败均已改为规则降级（不终止用户输入）
+        self._input_route_fatal = False
 
         # 延迟记忆召回日志：file_view 后触发的召回结果，推迟到下一 Turn 记录
         self._pending_retrieval_result = None
@@ -155,6 +166,20 @@ class QueryLoop:
         self.prompt_cache_miss = 0
         self.completion_tokens = 0
 
+        # 5. 重置视觉运行时单例（view_image 会话级熔断计数归零，multimodal_spec 7.4）
+        try:
+            from wdclaude.vision import reset_vision_runtime
+            reset_vision_runtime()
+        except Exception as e:
+            logger.warning(f"重置视觉运行时失败: {e}")
+
+        # 6. 重置 web_search / web_fetch 会话级调用计数（spec 9.3 L2）
+        try:
+            from wdclaude.tools.web_search import reset_session_counters
+            reset_session_counters()
+        except Exception as e:
+            logger.warning(f"重置 web 会话计数失败: {e}")
+
         logger.info("新 Session 已开启（上下文已重置，记忆保留）")
 
 
@@ -216,6 +241,12 @@ class QueryLoop:
         self._query_counter += 1
         self.session.start_query(self._query_counter, user_input)
         self._current_query_text = user_input  # 供追问 token 记录使用
+        # 记录最近一条用户消息，供 web_search 的 ori_question 自动附加（spec 9.4）
+        try:
+            from wdclaude.tools import web_search as _ws
+            _ws.set_last_user_input(user_input)
+        except Exception:
+            pass
         self._query_finalized = False  # 本 Query 收尾待执行（_finalize_query 幂等完成）
         self._turn_memory_saved = False  # Turn 记忆待保存（中断补存判据）
         self.max_turns = global_cfg.cli.max_turns
@@ -224,6 +255,7 @@ class QueryLoop:
         self._todo_manager.reset()  # 每次新 Turn 重置 todo 列表
         self._pending_memory_recall = False  # 重置延迟召回标志
         self._current_user_input = ""  # 清空缓存的用户输入
+        self._input_route_fatal = False  # 重置输入分流 fail-fast 标志（multimodal_spec D8）
         self._pending_retrieval_result = None  # 清空延迟召回日志缓存
         self._file_view_counts = {}  # 重置 file_view 重复查看计数器
         self._last_tool_sig = None  # 重置工具签名熔断器（跨 Query 不比对，防止误熔断）
@@ -263,6 +295,11 @@ class QueryLoop:
             with on_context_mgr(f"Thinking-{turn}"):  # 显示“thinking”在闪烁，表明系统未死，只是在等LLM的回复
                 # 发送请求给LLM，前期准备
                 thinking_begin = self._on_llm_req(turn, user_input)
+
+                # ===== 输入分流 fail-fast 兜底检查（L1/视觉失败已降级，正常不触发）=====
+                if self._input_route_fatal:
+                    quit_chat = ChatOrNot.QuitByNoneTool
+                    break
 
                 # 发送请求给LLM
                 # ===== 优雅退出：流式等待期间被中断时断流退出 =====
@@ -377,6 +414,20 @@ class QueryLoop:
                 if self._memory.check_evolution_needed():
                     self._print_info("记忆需要进化，执行 /mem evolution 命令进化记忆")
 
+                # 4.2 记忆提取提示（提取为手动命令 /mem extract）
+                # 空库场景（MEMORY.md 为空）下 4.1 的两个提示永不触发，
+                # MD 会话日志会无限累积而无人提醒——由此补充提取引导，
+                # 阈值 10 对齐旧版 raw_prompt_threshold 语义
+                try:
+                    mem_stats = self._memory.stats()
+                    md_pending = mem_stats.get("md_pending", 0)
+                    if md_pending >= 10:
+                        self._print_info(
+                            f"已积累 {md_pending} 个会话日志待提取，执行 /mem extract 命令提取记忆"
+                        )
+                except Exception as e:
+                    logger.warning(f"记忆提取提示检查失败: {e}")
+
                 logger.info("记忆生命周期维护完成")
             except Exception as e:
                 logger.error(f"记忆生命周期处理失败: {e}")
@@ -453,6 +504,299 @@ class QueryLoop:
     3. 纠结了好几天，最终决定与自己和解，不再追求完全解耦了
     """
 
+    # ==================================================================
+    # L0/L1 输入分流（multimodal_spec 3.1 / 3.2，D4/D6/D8/D9）
+    # ==================================================================
+    def _get_media_extensions(self) -> list:
+        """惰性装配媒体注册表，返回已启用媒体的扩展名清单（D10 配置驱动）。
+
+        装配失败（media.handlers 缺失等）降级为空清单：L0 退化为纯文本
+        引用检测，媒体文件按普通候选走 L1，不影响主流程。
+        """
+        if self._vision_registry is not None or self._vision_registry_failed:
+            return self._vision_registry.media_extensions if self._vision_registry else []
+        try:
+            from wdclaude.vision.media_types import MediaRegistry
+            self._vision_registry = MediaRegistry.from_config(global_cfg.media)
+            logger.info(f"媒体注册表装配完成: {self._vision_registry.describe()}")
+            return self._vision_registry.media_extensions
+        except Exception as e:
+            logger.warning(f"媒体注册表装配失败，媒体引用按文本候选处理: {e}")
+            self._vision_registry_failed = True
+            return []
+
+    def _vision_config(self, key: str, default):
+        """安全读取 vision 配置项（段缺失时返回默认值）。"""
+        vision_cfg = getattr(global_cfg, "vision", None)
+        return getattr(vision_cfg, key, default) if vision_cfg is not None else default
+
+    def _route_input_references(self, query_text: str):
+        """L0 检测 -> L1 意图分类 -> 按角色分岔（multimodal_spec 3.1 总流程）。
+
+        静默执行（用户不感知分类过程），返回：
+        - recall_query: 记忆召回查询文本（A + L1 summary + 引用角色清单 + B 摘要）
+        - preread_paths: requirement_doc 角色路径清单（召回后由调用方预读注入）
+        - b_message: 视觉 B 消息文本（无 media_input 时为 None）
+
+        分岔规则（3.1）：
+        - L0 零候选 -> 纯文字路径（零侵入，返回原文）
+        - 有候选 -> L1 分类（simple_chat 单轮旁路，重试 2 次）
+          a) 含 media_input 且 vision.enabled -> 视觉提取 B -> 召回查询增强
+          b) requirement_doc -> 收集预读清单（召回后预读）
+          c) operation_target -> 不预读不延迟（直接召回，解决"莽撞"问题）
+        - vision.enabled=false / intent_classify_enabled=false -> 回退旧行为
+          （候选一律按需求文档：延迟召回 _pending_memory_recall=True）
+        - L1 失败 -> 规则降级分类（媒体扩展名->media_input，其余->operation_target），
+          任务照常进行（分类是便利性优化，降级而非终止用户输入）
+        - 视觉提取失败 -> 降级为 view_image 引导提示（主循环可自行阅读图像）
+
+        本方法不再置 _input_route_fatal（原 D8/D9 fail-fast 已废止）。
+        """
+        from wdclaude.vision.input_resolver import resolve_input
+
+        media_exts = self._get_media_extensions()
+        resolved = resolve_input(query_text, media_exts)
+
+        # L0 零候选：纯文字路径，零侵入（3.4）——不进 L1、不碰视觉
+        if not resolved.has_references:
+            return query_text, [], None
+
+        candidates = [ref.path for ref in resolved.references]
+
+        # vision 总开关 / L1 开关关闭 -> 回退旧行为（候选一律按需求文档延迟召回）
+        if not self._vision_config("enabled", True) or not self._vision_config("intent_classify_enabled", True):
+            self._pending_memory_recall = True
+            self._current_user_input = query_text
+            self.session.log_dict_info({
+                "role": "system",
+                "content": f"[输入分流] vision/intent_classify 已关闭，回退旧行为：候选引用 {candidates} 按需求文档延迟召回"
+            })
+            return query_text, [], None
+
+        # L1 意图分类（simple_chat 单轮旁路，静默，3.2）
+        try:
+            from wdclaude.vision.intent_classifier import classify as intent_classify
+            from wdclaude.vision.intent_classifier import IntentClassifyFatalError
+
+            def _llm_call(user_message: str) -> str:
+                from wdclaude.vision.intent_classifier import load_prompt
+                # simple_chat 为单 user 消息接口（无 system 参数）：分类准则
+                # 拼接在 user 消息之前（L1 低温单轮调用，spec 3.2）
+                full_prompt = load_prompt() + "\n\n" + user_message
+                return chat_llm.simple_chat(full_prompt, temperature=0.1, max_tokens=2048)
+
+            intent = intent_classify(resolved.clean_text or query_text, candidates, _llm_call)
+        except IntentClassifyFatalError as e:
+            # 规则降级替代终止（原 D8 fail-fast 已废止）：L1 是便利性优化
+            # （决定预读/视觉提取/召回增强），失败时按扩展名规则分类即可，
+            # 绝不能因分类失败丢弃用户的整轮输入
+            intent = self._fallback_intent_result(candidates)
+            self._print_info(
+                f"[输入分流] 意图分类失败，已降级为按文件类型分类"
+                f"（图片视为图像输入，其余视为操作对象），任务继续。原因: {str(e)[:120]}"
+            )
+            self.session.log_dict_info({
+                "role": "system",
+                "content": f"[输入分流-降级] L1 失败: {e}；规则分类: {intent.role_list_text()}"
+            })
+        except Exception as e:
+            # simple_chat 本身异常（网络等）：同样规则降级（任务继续优于终止）
+            intent = self._fallback_intent_result(candidates)
+            self._print_info(
+                f"[输入分流] 意图分类调用异常，已降级为按文件类型分类，任务继续。原因: {str(e)[:120]}"
+            )
+            self.session.log_dict_info({
+                "role": "system",
+                "content": f"[输入分流-降级] L1 调用异常: {e}；规则分类: {intent.role_list_text()}"
+            })
+
+        # 分类成功或规则降级：记录角色裁定（日志审计）
+        self.session.log_dict_info({
+            "role": "system",
+            "content": f"[输入分流] L1 角色裁定: {intent.role_list_text()} | summary: {intent.summary}"
+        })
+
+        # 收集 requirement_doc 预读清单（召回后注入；operation_target 不预读）
+        preread_paths = [r.path for r in intent.requirement_refs]
+
+        # media_input 触发视觉提取链路（4.1）
+        b_message = None
+        b_summary = ""
+        if intent.media_refs and self._vision_config("enabled", True):
+            # 视觉提取失败时内部已降级为 view_image 引导（不终止本轮）
+            b_message, b_summary = self._run_vision_extraction(
+                [r.path for r in intent.media_refs],
+                pure_image=not (resolved.clean_text or "").strip(),
+            )
+
+        # 召回查询 = A + summary + 引用角色清单（+ B 摘要，spec 3.1）
+        recall_parts = [query_text]
+        if intent.summary:
+            recall_parts.append(f"[意图] {intent.summary}")
+        role_list = intent.role_list_text()
+        if role_list:
+            recall_parts.append(f"[引用] {role_list}")
+        if b_summary:
+            recall_parts.append(f"[视觉] {b_summary}")
+        recall_query = "\n".join(recall_parts)
+        return recall_query, preread_paths, b_message
+
+    def _fallback_intent_result(self, candidates: list):
+        """L1 意图分类失败时的规则降级（扩展名启发式，零 LLM 依赖）。
+
+        降级策略（安全性优先）：
+        - 媒体扩展名（注册表启用项）-> media_input：视觉提取为只读操作，
+          失败时另有 view_image 引导兜底
+        - 其余 -> operation_target：不预读不延迟，主循环工具按需读取，
+          零误读风险（与 L1 prompt "拿不准时倾向 operation_target" 一致）
+
+        设计依据：L1 是便利性优化（决定预读/视觉提取/召回增强），失败时
+        降级规则即可；终止用户整轮输入是体验事故，绝不可取。
+        """
+        from wdclaude.vision.intent_classifier import IntentResult, RefRole
+
+        media_exts = {
+            str(e).lstrip(".").lower()
+            for e in self._get_media_extensions()
+            if str(e).strip()
+        }
+        refs = []
+        for p in candidates:
+            ext = p.rsplit(".", 1)[-1].lower() if "." in p else ""
+            role = "media_input" if ext in media_exts else "operation_target"
+            refs.append(RefRole(path=p, role=role))
+        return IntentResult(
+            references=refs,
+            is_multimodal=any(r.role == "media_input" for r in refs),
+            summary="",
+        )
+
+    def _run_vision_extraction(self, media_paths: list, pure_image: bool):
+        """视觉提取链路（multimodal_spec 4.1：预处理 -> 提取 -> B 渲染）。
+
+        返回 (b_message, b_summary)；视觉运行时在此惰性装配（main_mlm 路由）。
+        装配/提取失败降级为 view_image 引导提示（注入 micro_info，主循环可
+        自行阅读图像），不再终止本轮。
+        """
+        try:
+            from wdclaude.vision import get_vision_runtime, run_vision_pipeline
+            from wdclaude.vision.vision_client import VisionFatalError
+
+            # 共享进程级单例：与 view_image 工具统一熔断计数与 main_mlm 客户端
+            runtime = get_vision_runtime()
+
+            result, b_message = run_vision_pipeline(
+                media_paths, runtime.registry, runtime.extractor,
+                pure_image=pure_image,
+            )
+            self._print_info(f"[视觉提取] 已完成 {len(media_paths)} 张图像的结构化提取（main_mlm 路由）")
+            return b_message, result.brief_summary()
+        except VisionFatalError as e:
+            # 降级而非终止：注入 view_image 引导，主循环可自行阅读图像
+            # （view_image 自带错误处理与会话级熔断，失败原因可见可换图重试）
+            self._print_info(f"[视觉提取] 自动提取失败，已降级为 view_image 引导（{e}）")
+            self.session.log_dict_info({"role": "system", "content": f"[视觉-降级] {e}"})
+            self.api_messages.append_micro_info(
+                "system",
+                f"[视觉提示] 图像自动提取失败（{str(e)[:200]}）。"
+                f"如任务需要图像内容，请使用 view_image 工具逐张阅读: {', '.join(media_paths)}"
+            )
+            return None, ""
+        except Exception as e:
+            self._print_info(f"[视觉提取] 自动提取异常，已降级为 view_image 引导（{e}）")
+            self.session.log_dict_info({"role": "system", "content": f"[视觉-降级] 异常: {e}"})
+            self.api_messages.append_micro_info(
+                "system",
+                f"[视觉提示] 图像自动提取异常（{str(e)[:200]}）。"
+                f"如任务需要图像内容，请使用 view_image 工具逐张阅读: {', '.join(media_paths)}"
+            )
+            return None, ""
+
+    def _inject_preread(self, path: str):
+        """需求文档预读注入（召回之后，spec 3.1 b 路径）。
+
+        带行数上限（防超大文件撑爆上下文），注入文本明示截断情况，
+        完整内容仍可由主模型按需 file_view。
+        """
+        try:
+            from wdclaude.utility.file_tool import read_file
+            max_lines = 500
+            content = read_file(path, fallback="")
+            if not content:
+                self.api_messages.append_micro_info(
+                    "system",
+                    f"[预读失败] {path} 读取为空（不存在或编码异常），请用 file_view 确认",
+                )
+                return
+            lines = content.splitlines()
+            truncated = len(lines) > max_lines
+            if truncated:
+                content = "\n".join(lines[:max_lines])
+                content += f"\n...（共 {len(lines)} 行，已截断至前 {max_lines} 行，完整内容可用 file_view 查看）"
+            self.api_messages.append_micro_info(
+                "system", f"[需求文档预读] {path}\n{content}"
+            )
+            self._print_info(f"[预读] 需求文档已注入: {path}（{len(lines)} 行）")
+            self.session.log_dict_info({
+                "role": "system",
+                "content": f"[预读] {path} 已注入（{len(lines)} 行{'，截断' if truncated else ''}）"
+            })
+
+            # ===== F4：文档内嵌媒体引用检测（补 L0/L1 分流的嵌套引用盲区）=====
+            media_paths = self._detect_embedded_media_refs(content)
+            if media_paths:
+                hint = (
+                    f"[视觉提示] 需求文档 {path} 中引用了 {len(media_paths)} 个媒体文件：\n"
+                    + "\n".join(f"- {m}" for m in media_paths)
+                    + "\n阅读这些图片必须使用 view_image 工具（file_view 读图片只会得到二进制乱码）。"
+                    "任务涉及图片内容时，请依次调用 view_image 阅读后再继续。"
+                )
+                self.api_messages.append_micro_info("system", hint)
+                self._print_info(f"[视觉提示] 需求文档内嵌 {len(media_paths)} 个媒体文件引用，已提示使用 view_image")
+                self.session.log_dict_info({
+                    "role": "system",
+                    "content": f"[视觉提示] 文档内嵌媒体引用: {media_paths}"
+                })
+        except Exception as e:
+            logger.warning(f"需求文档预读失败: {path} ({e})")
+            self.api_messages.append_micro_info(
+                "system", f"[预读失败] {path}（{e}），请用 file_view 读取"
+            )
+
+    def _detect_embedded_media_refs(self, doc_content: str) -> list:
+        """检测需求文档内容中内嵌的媒体文件引用（F4，复用 L0 正则检测）。
+
+        场景：用户输入只引用了需求文档（如 "do as xxx.txt"），但文档内部
+        嵌套引用了图片——L0/L1 分流只看用户输入层，覆盖不到这类嵌套引用。
+        预读注入后对文档正文做一次媒体扩展名扫描，发现引用即注入视觉提示，
+        引导 LLM 用 view_image 阅读图片而非 file_view 硬读。
+
+        返回去重后的媒体路径清单。仅做扩展名匹配，不做存在性检查
+        （路径问题由 view_image 执行时暴露）。
+        """
+        try:
+            from wdclaude.vision.input_resolver import resolve_input
+            media_exts = self._get_media_extensions()
+            if not media_exts or not doc_content:
+                return []
+            norm_exts = set()
+            for e in media_exts:
+                e = str(e).strip().lower()
+                if e:
+                    norm_exts.add(e if e.startswith(".") else "." + e)
+            resolved = resolve_input(doc_content, media_exts)
+            seen = set()
+            media_paths = []
+            for ref in resolved.references:
+                fname = ref.path.rsplit("/", 1)[-1].lower()
+                if any(fname.endswith(e) for e in norm_exts) and ref.path not in seen:
+                    seen.add(ref.path)
+                    media_paths.append(ref.path)
+            return media_paths
+        except Exception as e:
+            logger.warning(f"文档内嵌媒体引用检测失败: {e}")
+            return []
+
     @staticmethod
     def _references_file(text: str) -> bool:
         """检测用户输入是否引用了文件路径。
@@ -495,21 +839,55 @@ class QueryLoop:
                 self.api_messages.init_api_msg(user_input)
                 query_text = user_input
 
+            # ===== L0/L1 输入分流（multimodal_spec 3.1，静默执行，不预告）=====
+            # L0 检测 -> L1 角色裁定 -> B 提取/预读清单/召回查询增强；
+            # 零候选时零侵入（recall_query 即原文）；fail-fast 时置 _input_route_fatal
+            recall_query, preread_paths, b_message = self._route_input_references(query_text)
+
+            # 输入分流 fail-fast 兜底检查（防御性保留：当前正常流程不会置位）
+            if self._input_route_fatal:
+                # 孤儿消息清理：本轮 A 从未发给 LLM，残留会使下一轮出现
+                # 无回应的 user 消息。非命令模式下回滚刚注入的 A
+                # （命令模式的消息生命周期由 reset_with_command 管理，不在此处理）
+                msgs = self.api_messages.api_messages
+                if msgs and msgs[-1].get("role") == "user" and not self._command_context:
+                    msgs.pop()
+                return datetime.now().strftime("%Y-%m-%d %H : %M : %S")
+
+            # B 消息注入（B 前 A 后，4.7）：先插会话级视觉说明（4.6，仅一次）
+            # 再插 B，两次 insert 均落在 A 之前，得到 [说明, B, A] 排布
+            if b_message:
+                if not self._vision_notice_injected:
+                    self._vision_notice_injected = True
+                    from wdclaude.vision.vision_extractor import SESSION_VISION_NOTICE
+                    self.api_messages.insert_before_last_user(SESSION_VISION_NOTICE)
+                self.api_messages.insert_before_last_user(b_message)
+                self.session.log_dict_info({
+                    "role": "system",
+                    "content": "[视觉提取] B 消息已注入（" + b_message[:80].replace(chr(10), " ") + "...）"
+                })
+
+            # 需求文档预读注入（spec 3.1：召回查询不含预读内容——recall_query
+            # 已在分流时构建完毕；operation_target 不预读，杜绝"提到文件就预读"）
+            for preread_path in preread_paths:
+                self._inject_preread(preread_path)
+
             # 注入记忆上下文（通过 MemoryInterface 统一接口）
-            # 如果用户输入引用了文件，推迟记忆召回到 file_view 执行后
-            if self._references_file(query_text):
-                self._pending_memory_recall = True
-                self._current_user_input = query_text
+            # 记忆召回时机（multimodal_spec 3.1）：
+            # - 零引用 / 全部 operation_target -> 立即召回（静默分类后直接打印结果）
+            # - requirement_doc -> 召回查询 = A + summary + 引用角色清单（预读不参与）
+            # - 回退模式（_pending_memory_recall=True，vision 关闭或装配失败）
+            #   -> 保持旧行为，延迟到 file_view 后召回
+            if self._pending_memory_recall:
                 self._memory_used = True
-                self._print_info("[记忆召回] 检测到文件引用，延迟到文件读取后召回")
             else:
                 try:
                     # 传入当前 session_id，确保不召回本 session 产生的记忆
                     current_session_id = getattr(self.session, 'session_file_name', '')
-                    # 设置 token 统计上下文，标记为记忆召回
-                    chat_llm.set_context(query=query_text, turn=f"turn{turn}-recall")
+                    # 设置 token 统计上下文，标记为记忆召回（查询为分流增强后的 recall_query）
+                    chat_llm.set_context(query=recall_query, turn=f"turn{turn}-recall")
                     mem_context = self._memory.get_context_for_query(
-                        query_text, exclude_session_id=current_session_id
+                        recall_query, exclude_session_id=current_session_id
                     )
                     chat_llm.set_context()  # 清除上下文
                     self._memory_used = True
@@ -538,7 +916,7 @@ class QueryLoop:
 
                     if mem_context:
                         self.api_messages.append_micro_info("system", mem_context)
-                        logger.debug(f"记忆上下文已注入，长度: {len(mem_context)}")
+                        logger.debug(f"记忆上下文已注入，长度: {len(mem_context)}（查询: {recall_query[:120]}）")
                     elif not retrieval_result:
                         # retrieval_result 已通过 log_memory_retrieval 记录，不重复注入
                         self.api_messages.append_micro_info("system", "[MEMORY_INJECTION_v1]\n没有召回到相关记忆\n[召回数: 0]")
@@ -969,7 +1347,7 @@ class QueryLoop:
         def _sig_of(t):
             p = t.get("params", {}) or {}
             bits = []
-            for k in ("path", "command", "query", "question", "name", "intent", "sheet"):
+            for k in ("path", "command", "query", "question", "name", "intent", "sheet", "url"):
                 v = p.get(k)
                 if v is not None:
                     bits.append(f"{k}={v}")
@@ -1095,6 +1473,17 @@ class QueryLoop:
                         try:
                             result_msg = tool_executor.execute_code_tool(t)  # 工具执行
                         except Exception as e:
+                            # 视觉链路 fail-fast（multimodal_spec D8）：view_image 的
+                            # VisionFatalError 终止本轮，不降级为普通错误文本
+                            try:
+                                from wdclaude.vision.vision_client import VisionFatalError
+                                if isinstance(e, VisionFatalError):
+                                    self._input_route_fatal = True
+                                    self._print_info(f"[视觉终止] {e}；建议检查网络/换图/减少图片数量后重试")
+                                    self.session.log_dict_info({"role": "system", "content": f"[视觉-fail-fast] {e}"})
+                                    return ChatOrNot.QuitByNoneTool, tool_exec_info
+                            except ImportError:
+                                pass
                             logger.error(f"工具执行异常 [{t['llm_tool']}]: {e}")
                             result_msg = {
                                 "role": "user",

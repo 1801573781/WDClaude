@@ -29,6 +29,12 @@ class MyClaudeCLI:
 
         # 静默加载斜杠命令，不打印提示信息
 
+        # ===== web_search / web_fetch display 双通道接线（spec 10.2 Q1）=====
+        # CLI 层注册渲染回调：tool_executor 分发 display -> cli_print Rich 面板。
+        # 引擎不直接 import cli_print 的架构契约不变（回调注入方式）
+        from wdclaude.llm_tool import tool_executor as _tool_executor
+        _tool_executor.set_web_display_callback(cli_print.print_web_display)
+
         # ===== 优雅退出（阶段三）：注册清理任务与会话统计 =====
         # 屏幕输出缓冲保存为 HTML（优先级 80，尽力完成级别）
         shutdown_mgr.register_cleanup(
@@ -624,7 +630,7 @@ class MyClaudeCLI:
             return True
 
         elif cmd == '/help':
-            cli_print.print_welcome()
+            cli_print.print_welcome(registry=self.registry)
             return True
 
         elif cmd == '/tokens':
@@ -1839,6 +1845,46 @@ class MyClaudeCLI:
                 self.query_loop.append_cli_result(summary_text)
             return True
 
+        elif cmd == '/ss' or cmd.startswith('/ss '):
+            # /ss <filename> — 手动保存屏幕输出存档（与退出时自动生成的存档完全一致）
+            # 后缀 .html → HTML 存档；.md → Markdown 存档；其他后缀 → 格式非法，退出命令
+            # filename 含全路径则按全路径保存；仅文件名则存放在 .wdclaude/tmp_output
+            parts = command.strip().split(maxsplit=1)
+            filename = parts[1].strip().strip('"').strip("'") if len(parts) > 1 else ""
+            if not filename:
+                cli_print.print_error("缺少参数。用法: /ss <filename>（后缀 .html 或 .md）")
+                return True
+
+            from wdclaude.cli import cli_print as _cp
+            from wdclaude.paths import paths as _paths
+
+            # 缓冲为空则跳过（与退出时自动保存的空缓冲守卫一致）
+            if not _cp._html_parts:
+                cli_print.print_error("屏幕输出缓冲为空，无内容可保存")
+                return True
+
+            filepath = Path(filename)
+            if not filepath.is_absolute():
+                # 仅文件名：存放到 B/.wdclaude/tmp_output
+                filepath = _paths.code_output_dir / filepath.name
+
+            ext = filepath.suffix.lower()
+            if ext not in ('.html', '.md'):
+                cli_print.print_error(
+                    f"格式非法: {ext if ext else '无后缀'}，仅支持 .html 或 .md 后缀，退出命令"
+                )
+                return True
+
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            if ext == '.html':
+                saved_path = save_buffer_to_file(str(filepath), all=True)
+            else:
+                saved_path = save_buffer_to_markdown(str(filepath), all=True)
+
+            cli_print.print_info(f"屏幕输出存档已保存到: {saved_path}")
+            self.query_loop.append_cli_result(f"屏幕输出存档已保存到: {saved_path}")
+            return True
+
         elif cmd.startswith('/save'):
             # /save <filename> [all] — 保存屏幕输出到文件（HTML/Word）
             parts = command.strip().split(maxsplit=2)
@@ -2319,10 +2365,12 @@ class MyClaudeCLI:
     def run(self):
         """运行 CLI 主循环：聊天流式 + 编码工具双模式（全同步）"""
         # cli_print.clear_screen()
-        cli_print.print_welcome()
 
-        # 启动后先询问设置项目目录（未设置时），再进入 "➤ You :" 输入循环
+        # 启动后先询问设置项目目录（未设置时），完成 /init 相关信息的输出；
+        # 欢迎页面后置：待 /init 信息打印完后再显示，使其紧跟输入提示符
         self._prompt_project_root_setup()
+
+        cli_print.print_welcome(registry=self.registry)
 
         while True:
             try:

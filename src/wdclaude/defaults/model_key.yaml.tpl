@@ -7,9 +7,10 @@
 #   4. ~/.wdclaude/model_key.yaml 可作为全局兜底（多项目共用一份密钥时使用）
 #
 # 结构说明：
-#   - 顶层各节（GPT / GLM-main / DeepSeek ...）= 服务商连接参数，节名即 provider 名，可按需增删
+#   - 顶层各节（GPT / GLM-main / DeepSeek-main ...）= 服务商连接参数，节名即 provider 名，可按需增删
 #   - main_model.provider  = 主模型（对话与编码）使用哪个 provider
 #   - simple_chat.provider = 记忆提取/整理/进化、意图压缩等单轮调用使用哪个 provider
+#   - main_mlm.provider    = 多模态模型（视觉提取/view_image/native 模式）使用哪个 provider
 #   - memory.*             = 记忆系统的向量化与精排模型
 #   - web_search           = 联网搜索后端（与 config.yaml 的 web_search 参数段配合）
 
@@ -51,17 +52,17 @@ GLM-Embedding:
   base_url: "https://open.bigmodel.cn/api/paas/v4/embeddings"
   model_name: "embedding-3"
 
-# DeepSeek API 连接参数
-DeepSeek:
+# DeepSeek API 连接参数（DeepSeek 当前最先进模型）
+DeepSeek-main:
   api_key: "***"
   base_url: "https://api.deepseek.com"
-  model_name: "deepseek-v4.1-flash"
+  model_name: "deepseek-flash"
 
 # DeepSeek Flash API 连接参数
 DeepSeek-Flash:
   api_key: "***"
   base_url: "https://api.deepseek.com"
-  model_name: "deepseek-v4.1-flash"
+  model_name: "deepseek-flash"
 
 # MiniMax API 连接参数
 MiniMax:
@@ -75,16 +76,32 @@ Qwen-2.5:
   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
   model_name: "qwen2.5-7b-instruct"
 
-# ===== 互联网搜索工具后端 =====
-# provider 可选: tavily / bocha / zhipu / duckduckgo
-web_search:
-  provider: "zhipu"
+# GLM 多模态模型（main_mlm 路由，视觉提取 / view_image / native 多模态模式）
+GLM-main-mlm:
   api_key: "***"
-  base_url: "https://open.bigmodel.cn/api/paas/v4/tools"
+  base_url: "https://open.bigmodel.cn/api/paas/v4"
+  model_name: "glm-5.3-flashx"
+  extra_body:
+    thinking:
+      type: "enabled"
+
+# ===== 互联网搜索工具后端 =====
+# DeepSeek 提供了 web_search 接口：provider 直接引用上方服务商节（复用其 api_key），
+# search_api / fetch_api 分别为搜索与网页抓取接口
+web_search:
+  provider: "DeepSeek-main"
+  search_api: "POST https://api.deepseek.com/v1/tools/search"
+  fetch_api: "POST https://api.deepseek.com/v1/tools/fetch"
 
 # ===== 主模型选择（provider 填写上方任一节名）=====
 main_model:
   provider: "GLM-main"
+
+# ===== 多模态模型选择（provider 填写上方任一节名）=====
+# 用途：视觉提取（级联方案的 B 生产者）、view_image 执行、native 多模态模式下的主循环 LLM
+# 两级路由：main_mlm.provider -> 服务商节（api_key / base_url / model_name / extra_body）
+main_mlm:
+  provider: "GLM-main-mlm"
 
 # ===== 记忆系统模型参数 =====
 memory:
