@@ -99,8 +99,9 @@ Skill 行为模板（任务策略、工具组合规范、禁忌与示例）存�
 # 安装依赖
 pip install openai rich pyyaml numpy pytest requests
 
-# 配置 API Key
-# 编辑 config.yaml → model.api_key: "sk-..."
+# 配置 API Key（首启自动生成模板，无需提前手动创建）
+# 编辑 .wdclaude/config/model_key.yaml，将 *** 替换为真实密钥
+# 或设置环境变量 WDCLAUDE_API_KEY
 
 # 运行
 python -m src.wdclaude

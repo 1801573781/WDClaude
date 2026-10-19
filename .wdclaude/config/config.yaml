@@ -63,10 +63,13 @@ web_search:
   timeout: 10                # HTTP 超时（秒），search 与 fetch 共用
   max_retries: 2             # 失败重试次数（指数退避）
   cache_ttl: 3600            # 缓存有效期（秒），0 禁用；search 与 fetch 独立缓存
-  token_budget: 3000         # 单次搜索结果注入 token 预算
-  fetch_token_budget: 3000   # 单次抓取内容注入 token 预算
+  token_budget: 4000         # 单次搜索结果注入 token 预算（约 10000 字符，按 2.5 字符/token 折算）
+  fetch_token_budget: 8000   # 单次抓取内容注入 token 预算（约 20000 字符，超出时保留首尾、省略中段）
   min_interval: 2.0          # 两次真实请求（search/fetch 合计）最小间隔（秒）
   max_calls_per_session: 10  # 会话级调用上限（search 与 fetch 分别计数），0 = 不限
+  fetch_fail_ttl: 600        # 抓取失败负面缓存有效期（秒）：同一 URL 短期不再重复烧配额，0 禁用
+  domain_fail_threshold: 3   # 同一域名连续抓取失败达到该次数即熔断，0 禁用
+  domain_fail_cooldown: 600  # 域名熔断冷却时长（秒），到期自动解封
 
 # 视觉/多模态配置（spec/multimodal_spec.md 10.1）
 vision:

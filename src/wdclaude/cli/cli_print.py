@@ -1,6 +1,7 @@
 import math
 import os
 import re
+import sys
 import time
 from contextlib import contextmanager
 from html import escape as html_escape  # 用于 HTML 转义
@@ -1194,8 +1195,14 @@ def print_ask_user_question(question: str, choices: list[str] | None = None) -> 
         f'</div>'
     )
 
-    # 同步阻塞等待用户输入（与项目全同步架构一致）
-    user_input = Prompt.ask("\n[bold bright_cyan]>[/bold bright_cyan]")
+    # 同步阻塞等待用户输入（与项目全同步架构一致）。
+    # 与主输入框同源：prompt_toolkit 自绘优先（长回答/粘贴不再触发
+    # conhost cooked-mode 覆盖 bug），未装 PT 时回退 Rich Prompt.ask；
+    # Ctrl+C/EOF 与旧路径一致向上冒泡
+    if _HAS_PT:
+        user_input = _get_pt_session().prompt(ANSI("\n\x1b[96m>\x1b[0m "))
+    else:
+        user_input = Prompt.ask("\n[bold bright_cyan]>[/bold bright_cyan]")
     return user_input
 
 
@@ -1627,7 +1634,63 @@ def print_memory_recall_detailed(retrieval_result, query: str = ""):
     _append_html(''.join(html_parts))
 
 
+# ============================
+# 输入行获取：prompt_toolkit 自绘优先，内置 input() 降级
+# ============================
+# Windows conhost 的 cooked-mode 行编辑器（input() 的回显层）在长输入 +
+# CJK 宽字符场景下存在不软换行、回行首覆盖已有内容的固有问题：Rich
+# Live/status 等组件启用的 VT 状态（DECAWM/DECSTBM）会被 conhost 的
+# 回显路径错误消费，且 ConPTY 下该状态由终端保留，SetConsoleMode 恢复
+# 模式位管不到——三重保障只能缓解、间歇性复发，无法根治（wc-4 现场）。
+# prompt_toolkit（IPython 同款）自绘输入行：win32/vt100 renderer 逐帧
+# 重绘、行尾软换行按 CJK 显示宽度计算、粘贴与上下方向键历史完整支持，
+# 完全不经过 conhost cooked-mode 回显，从根上消灭长输入覆盖 bug。
+# 未安装 prompt_toolkit 时降级内置 input()（保留三重保障缓解逻辑）。
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.formatted_text import ANSI
+    from prompt_toolkit.history import InMemoryHistory
+
+    _HAS_PT = True
+except ImportError:
+    _HAS_PT = False
+
+_pt_session = None
+_ESC = chr(27)   # ANSI 转义前缀（用 chr 构造，源码中不出现反斜杠转义）
+_CRLF = chr(13) + chr(10)
+_PT_PROMPT = _ESC + "[92m➤ You : " + _ESC + "[0m"   # 主输入框提示符（亮绿）
+
+
+def _get_pt_session():
+    """惰性创建并复用全局 PromptSession（会话内上下方向键输入历史）。"""
+    global _pt_session
+    if _pt_session is None:
+        _pt_session = PromptSession(history=InMemoryHistory())
+    return _pt_session
+
+
 def get_input() -> str:
+    """获取用户输入（主输入框）。
+
+    优先 prompt_toolkit 自绘输入行（见上方模块级注释：根治 conhost
+    cooked-mode 长输入不换行/覆盖 bug）；Ctrl+C / EOF 统一转 "/quit"
+    交给主循环的优雅退出流程。未安装 prompt_toolkit 时降级走
+    _get_input_builtin()（内置 input + 三重保障缓解逻辑）。
+    """
+    if _HAS_PT:
+        try:
+            # 新起一行（CR+LF）再渲染提示符：光标回到行首列 0，
+            # 避免 PT 渲染区起点紧贴上一条 Rich 输出的行尾
+            sys.stdout.write(_CRLF)
+            sys.stdout.flush()
+            user_input = _get_pt_session().prompt(ANSI(_PT_PROMPT))
+            return user_input.strip()
+        except (KeyboardInterrupt, EOFError):
+            return "/quit"
+    return _get_input_builtin()
+
+
+def _get_input_builtin() -> str:
     """获取用户输入
 
     使用 Python 内置 input() 读取用户输入。

@@ -105,6 +105,9 @@ class WebSearchConfig:
     fetch_token_budget: int = 3000       # 单次抓取内容注入 token 预算
     min_interval: float = 2.0            # 两次真实请求（search/fetch 合计）最小间隔（秒）
     max_calls_per_session: int = 10      # 会话级调用上限（search/fetch 分别计数），0 = 不限
+    fetch_fail_ttl: int = 600            # 抓取失败负面缓存有效期（秒），0 禁用
+    domain_fail_threshold: int = 3       # 同域名连续抓取失败达到该次数即熔断，0 禁用
+    domain_fail_cooldown: int = 600      # 域名熔断冷却时长（秒），到期自动解封
 
 
 def _to_bool(value) -> bool:
@@ -177,6 +180,12 @@ def load_ws_config() -> WebSearchConfig:
     cfg.min_interval = _to_float(getattr(ws, "min_interval", cfg.min_interval), cfg.min_interval)
     cfg.max_calls_per_session = _to_int(
         getattr(ws, "max_calls_per_session", cfg.max_calls_per_session), cfg.max_calls_per_session)
+    cfg.fetch_fail_ttl = _to_int(
+        getattr(ws, "fetch_fail_ttl", cfg.fetch_fail_ttl), cfg.fetch_fail_ttl)
+    cfg.domain_fail_threshold = _to_int(
+        getattr(ws, "domain_fail_threshold", cfg.domain_fail_threshold), cfg.domain_fail_threshold)
+    cfg.domain_fail_cooldown = _to_int(
+        getattr(ws, "domain_fail_cooldown", cfg.domain_fail_cooldown), cfg.domain_fail_cooldown)
     return cfg
 
 
@@ -403,9 +412,16 @@ _session_call_counts = {"web_search": 0, "web_fetch": 0}
 
 
 def reset_session_counters():
-    """重置会话级调用计数（新 Session 时由 query_loop 调用）。"""
+    """重置会话级调用计数、抓取失败缓存与域名熔断（新 Session 时由 query_loop 调用）。
+
+    失败缓存与熔断虽是进程级优化，但语义上属于「当前会话的已知坏地址」，
+    新会话应当重新给这些站点一次机会（站点可能已恢复，或换了网络环境）。
+    """
     for k in _session_call_counts:
         _session_call_counts[k] = 0
+    _fetch_fail_cache.clear()
+    global _breaker_instance
+    _breaker_instance = None
 
 
 def _check_session_limit(tool: str, cfg: WebSearchConfig) -> tuple:
@@ -453,6 +469,107 @@ def _get_rate_limiter(cfg: WebSearchConfig) -> RateLimiter:
     if _rate_limiter_instance is None:
         _rate_limiter_instance = RateLimiter(cfg.min_interval)
     return _rate_limiter_instance
+
+
+class DomainCircuitBreaker:
+    """域名级熔断：同一站点连续抓取失败 N 次后，冷却期内直接拒绝。
+
+    动机：一次问答里 LLM 常对同一站点连续尝试多个 URL（维基中文/英文/
+    移动版、同一站的不同路径）。每次失败都要走满重试 + 指数退避，
+    单轮耗时可达数十秒，而结果必然相同。熔断把这类重复失败压缩为
+    一次 O(1) 判定，并把「换源」信号明确传给 LLM。
+    """
+
+    def __init__(self, threshold: int, cooldown: int):
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self._fails = {}      # host -> 连续失败次数
+        self._open_until = {}  # host -> 熔断解除时间戳
+
+
+    @staticmethod
+    def host_of(url: str) -> str:
+        try:
+            return (urlparse(url).hostname or "").lower()
+        except ValueError:
+            return ""
+
+
+    def check(self, url: str) -> str:
+        """熔断中返回剩余秒数的说明文本，正常返回空字符串。"""
+        if self.threshold <= 0 or self.cooldown <= 0:
+            return ""
+        host = self.host_of(url)
+        until = self._open_until.get(host)
+        if not until:
+            return ""
+        remain = until - time.time()
+        if remain <= 0:
+            self._open_until.pop(host, None)
+            self._fails.pop(host, None)
+            return ""
+        return (f"{host} 已连续抓取失败 {self.threshold} 次，域名熔断中"
+                f"（约 {int(remain)} 秒后自动解除）")
+
+
+    def record_fail(self, url: str):
+        if self.threshold <= 0:
+            return
+        host = self.host_of(url)
+        if not host:
+            return
+        cnt = self._fails.get(host, 0) + 1
+        self._fails[host] = cnt
+        if cnt >= self.threshold:
+            self._open_until[host] = time.time() + self.cooldown
+            logger.warning(f"域名熔断开启: {host}（连续失败 {cnt} 次）")
+
+
+    def record_ok(self, url: str):
+        host = self.host_of(url)
+        if host:
+            self._fails.pop(host, None)
+            self._open_until.pop(host, None)
+
+
+_breaker_instance = None
+
+
+def _get_breaker(cfg: WebSearchConfig) -> DomainCircuitBreaker:
+    global _breaker_instance
+    if _breaker_instance is None:
+        _breaker_instance = DomainCircuitBreaker(
+            cfg.domain_fail_threshold, cfg.domain_fail_cooldown)
+    return _breaker_instance
+
+
+# 抓取失败负面缓存：进程内短期记忆（不落盘、不进 KV 缓存文件）。
+# 与 KV 缓存分开实现，因为失败是瞬态信息，不值得持久化污染缓存文件。
+_fetch_fail_cache = {}
+
+
+def _fetch_fail_get(url: str, ttl: int):
+    """命中返回失败说明文本，未命中/过期返回 None。"""
+    if ttl <= 0:
+        return None
+    entry = _fetch_fail_cache.get(url)
+    if not entry:
+        return None
+    ts, msg = entry
+    if time.time() - ts > ttl:
+        _fetch_fail_cache.pop(url, None)
+        return None
+    return msg
+
+
+def _fetch_fail_put(url: str, msg: str, ttl: int):
+    if ttl <= 0:
+        return
+    _fetch_fail_cache[url] = (time.time(), msg)
+    if len(_fetch_fail_cache) > 200:
+        oldest = sorted(_fetch_fail_cache.items(), key=lambda kv: kv[1][0])
+        for k, _ in oldest[:100]:
+            _fetch_fail_cache.pop(k, None)
 
 
 def _search_cache_key(query: str, count: int, need_content: bool) -> str:
@@ -549,14 +666,22 @@ class ToolsApiSearchService(WebSearchService):
         - 200 但响应非 JSON → 抛 WebApiError（附原始响应前 500 字符）。
         """
         last_err = None
+        attempts = 0
         for attempt in range(self.cfg.max_retries + 1):
+            attempts = attempt + 1
             try:
                 resp = requests.post(url, json=payload, headers=self._headers(),
                                      timeout=self.cfg.timeout)
             except requests.exceptions.Timeout:
-                last_err = f"请求超时（{self.cfg.timeout}s），可能是网络波动或需要代理"
+                last_err = (
+                    f"请求超时（单次上限 {self.cfg.timeout}s，第 {attempts} 次尝试）。"
+                    f"该 URL 指向的站点响应过慢或抓取端点不可达；"
+                    f"可提高 web_search.timeout 后重试，或改抓该故事的镜像源/缓存页"
+                )
+            except requests.exceptions.SSLError as e:
+                last_err = f"TLS 握手失败（证书或代理拦截）: {e}"
             except requests.exceptions.ConnectionError as e:
-                last_err = f"连接失败（检查网络连通性/代理设置）: {e}"
+                last_err = f"连接失败（DNS 解析/网络连通性/代理设置）: {e}"
             except requests.exceptions.RequestException as e:
                 last_err = f"请求异常: {e}"
             else:
@@ -576,7 +701,7 @@ class ToolsApiSearchService(WebSearchService):
                     raise WebApiError(resp.status_code, msg)
             if attempt < self.cfg.max_retries:
                 time.sleep(2 ** attempt)  # 指数退避：1s, 2s
-        raise RuntimeError(last_err or "未知请求错误")
+        raise RuntimeError(f"{last_err or '未知请求错误'}（实际尝试 {attempts} 次）")
 
 
     # ---- 协议原语 ----
@@ -761,6 +886,35 @@ def _fetch_result_from_dict(d: dict) -> FetchResult:
 
 # ======================== 结果后处理与格式化 ========================
 
+# token→字符换算系数：中英混排约 1 token ≈ 2.5 字符。
+# 纯中文约 1 token ≈ 1.5~2 字符，纯英文约 1 token ≈ 4 字符，取折中值，
+# 避免旧实现（固定 *2）在英文长页面上低估可用字符数、在中文页面上高估。
+_CHARS_PER_TOKEN = 2.5
+
+
+def _truncate_middle(text: str, limit: int, head_ratio: float = 0.75) -> tuple:
+    """头尾保留截断：返回 (截断后文本, 是否截断, 省略字符数)。
+
+    纯头部截断会把页面尾部的数据表、签表、奖金列表整段丢弃，这些恰恰是
+    结构化信息最密集的部分。改为「留头 75% + 留尾 25% + 中间省占位」，
+    让模型既看到开篇结论，也能读到收尾的数据表。
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text, False, 0
+    marker_reserve = 120
+    keep = max(200, limit - marker_reserve)
+    head_len = int(keep * head_ratio)
+    tail_len = max(0, keep - head_len)
+    omitted = len(text) - head_len - tail_len
+    if omitted <= 0:
+        return text, False, 0
+    marker = (
+        f"\n\n…（此处省略 {omitted} 字符，因单次注入 token 预算限制；"
+        f"首尾已完整保留）…\n\n"
+    )
+    return text[:head_len] + marker + text[-tail_len:], True, omitted
+
+
 def _dedup(results: list) -> list:
     """按 URL 去重（忽略末尾斜杠与大小写）。
 
@@ -802,7 +956,7 @@ def _format_search_llm_text(query: str, results: list, provider_name: str,
             f"可尝试换更具体的关键词或使用搜索语法（site: / lang: / after: 等）；"
             f"若换词后仍为空，请基于已有知识回答并声明未能联网获取实时数据。"
         ), 0
-    char_budget = max(500, token_budget * 2)
+    char_budget = max(500, int(token_budget * _CHARS_PER_TOKEN))
     entries = []
     used = 0
     for i, r in enumerate(results, 1):
@@ -816,13 +970,21 @@ def _format_search_llm_text(query: str, results: list, provider_name: str,
             meta_parts.append(f"权威: {r.authority}/4")
         if r.rerank_score is not None:
             meta_parts.append(f"排序分: {r.rerank_score}")
-        entry = f"{i}. {r.title or '（无标题）'}\n   URL: {r.url}"
+        head = f"{i}. {r.title or '（无标题）'}\n   URL: {r.url}"
         if meta_parts:
-            entry += "\n   " + " | ".join(meta_parts)
-        entry += f"\n   摘要: {summary}"
+            head += "\n   " + " | ".join(meta_parts)
+        entry = head + f"\n   摘要: {summary}"
         if r.content:
             entry += f"\n   正文: {r.content}"
-        if used + len(entry) > char_budget:
+        remain = char_budget - used
+        if remain <= len(head) + 60:
+            break
+        if len(entry) > remain:
+            # 末条不整条丢弃：保留标题与元信息，裁切摘要正文后再收尾
+            keep = max(80, remain - len(head) - 60)
+            cut = summary[:keep]
+            entries.append(f"{head}\n   摘要: {cut}…（本条摘要因注入预算截断）")
+            used = char_budget
             break
         entries.append(entry)
         used += len(entry)
@@ -919,12 +1081,18 @@ def _search_output(cfg: WebSearchConfig, query: str, results: list, cached: bool
 
 def _fetch_output(cfg: WebSearchConfig, fr: FetchResult, cached: bool) -> dict:
     """抓取成功路径的双通道输出：markdown 按 fetch_token_budget 首部截断（spec 7.4）。"""
-    char_budget = max(500, cfg.fetch_token_budget * 2)
+    char_budget = max(500, int(cfg.fetch_token_budget * _CHARS_PER_TOKEN))
     full_chars = len(fr.markdown)
-    truncated = full_chars > char_budget
-    markdown = fr.markdown[:char_budget] if truncated else fr.markdown
+    markdown, truncated, omitted = _truncate_middle(fr.markdown, char_budget)
     title_part = f"{fr.title} | " if fr.title else ""
-    trunc_part = "，因预算截断" if truncated else ""
+    if truncated:
+        trunc_part = f"，首尾保留注入，中段省略 {omitted} 字符"
+        notice = (f"内容 {full_chars} 字符超出单次预算（约 {cfg.fetch_token_budget} token），"
+                  f"已保留首尾、省略中段 {omitted} 字符；如需完整内容可分段抓取或提高 "
+                  f"web_search.fetch_token_budget")
+    else:
+        trunc_part = ""
+        notice = ""
     llm_text = (f"[web_fetch] {title_part}{fr.url}"
                 f"（Markdown {full_chars} 字符{trunc_part}）:\n{markdown}")
     display = {
@@ -935,8 +1103,9 @@ def _fetch_output(cfg: WebSearchConfig, fr: FetchResult, cached: bool) -> dict:
         "cached": cached,
         "char_count": full_chars,
         "truncated": truncated,
+        "omitted_chars": omitted,
         "preview": _fetch_preview(markdown),
-        "notice": "内容因 token 预算截断，仅注入前部" if truncated else "",
+        "notice": notice,
         "error": False,
     }
     return {"llm_text": llm_text, "display": display}
@@ -985,9 +1154,18 @@ def _api_error_text(e: WebApiError, tool: str) -> str:
                     f"请更换 URL，或改用 web_search 定位其他来源。")
         return f"{head}: {e.message}\n请勿原样重试。"
     if code == 404:
+        # 抓取端点的 404 有两类完全不同的成因，混在一起会让 LLM 误判为「网址错了」：
+        #  (a) 上游站点确实返回 404（页面不存在/已删除）；
+        #  (b) 上游站点反爬拦截、返回非 HTML（PDF/JS 渲染页）或超时，
+        #      抓取网关统一以 404 上报「未能获取可用内容」。
+        # 后者换 URL 才有意义，前者提高超时或换镜像才有意义，故文案同时给出两路。
         if tool == "web_fetch":
-            return (f"{head}（未能获取可用内容：URL 不可用/站点拦截/内容类型不受支持/无可提取正文）: {e.message}\n"
-                    f"请换 URL、用 web_search 定位其他来源，或声明该页不可读。")
+            return (f"{head}（未能获取可用内容：抓取网关未取回正文）: {e.message}\n"
+                    f"常见成因两类：a) 源站反爬/需 JS 渲染/返回非 HTML，网关抓不到正文；"
+                    f"b) 该 URL 确实已失效。\n"
+                    f"处置：先用 web_search 检索同一主题的其他来源再抓取；"
+                    f"不要对同一 URL 原样重试；若整站抓取连续失败，改用搜索结果的 summary "
+                    f"作答并向用户说明原始页面不可读。")
         return f"{head}: {e.message}\n请勿原样重试。"
     return (f"{head}: {e.message}\n"
             f"若重试仍失败，请基于已有知识回答并声明未能联网。")
@@ -1175,6 +1353,24 @@ def _execute_web_fetch_impl(params: dict) -> dict:
             f"[BLOCKED] web_fetch URL 安全校验未通过：{deny}。\n"
             f"请更换合规的公网 URL，或改用 web_search 定位来源。")
 
+    # 失败负面缓存：同一 URL 短期内不必重复烧配额（命中直接返回旧失败说明）
+    fail_hit = _fetch_fail_get(url, cfg.fetch_fail_ttl)
+    if fail_hit:
+        return _error_output(
+            "web_fetch", url,
+            f"[ERROR] {fail_hit}\n该 URL 近期已抓取失败，本次直接复用失败结论、未再次请求。"
+            f"请更换来源（建议先用 web_search 检索同一主题）或声明该页不可读。")
+
+    # 域名熔断：同站连续失败后，冷却期内不再消耗请求与等待时间
+    breaker = _get_breaker(cfg)
+    break_msg = breaker.check(url)
+    if break_msg:
+        return _error_output(
+            "web_fetch", url,
+            f"[ERROR] web_fetch 跳过：{break_msg}\n"
+            f"该域名当前不可抓取，请改用 web_search 结果中的其他站点，"
+            f"或直接基于已有搜索结果作答并向用户说明原始页面不可读。")
+
     # 缓存命中（按 URL 为键，TTL 同 cache_ttl）
     cache = _get_fetch_cache(cfg)
     cache_key = _fetch_cache_key(url)
@@ -1198,17 +1394,26 @@ def _execute_web_fetch_impl(params: dict) -> dict:
         _session_call_counts["web_fetch"] += 1
         fr = service.fetch(url)
     except WebApiError as e:
-        return _error_output("web_fetch", url, _api_error_text(e, "web_fetch"))
+        text = _api_error_text(e, "web_fetch")
+        # 认证/余额/参数类错误属配置问题，不是「这个 URL 不行」，不进熔断计数
+        if e.status_code not in (0, 400, 401, 402, 403, 413):
+            breaker.record_fail(url)
+            _fetch_fail_put(url, f"web_fetch 抓取失败（HTTP {e.status_code}）", cfg.fetch_fail_ttl)
+        return _error_output("web_fetch", url, text)
     except RuntimeError as e:
+        breaker.record_fail(url)
+        _fetch_fail_put(url, f"web_fetch 请求失败（{e}）", cfg.fetch_fail_ttl)
         return _error_output(
             "web_fetch", url,
             f"[ERROR] web_fetch 执行失败（已重试 {cfg.max_retries} 次）: {e}\n"
             f"请换 URL 重试，或基于已有知识回答并声明该页不可读。")
     except Exception as e:  # noqa BLE001 兜底
         logger.error(f"web_fetch 执行异常: {e}")
+        breaker.record_fail(url)
         return _error_output(
             "web_fetch", url,
             f"[ERROR] web_fetch 异常: {e}\n请换 URL 重试，或声明该页不可读。")
+    breaker.record_ok(url)
 
     # 全量缓存（截断只发生在注入层，预算调大后缓存仍可提供全文）
     cache.put(cache_key, _fetch_result_to_dict(fr))

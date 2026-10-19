@@ -16,7 +16,9 @@ def _check() -> list:
     results.append((f"Python >= 3.10（当前 {sys.version.split()[0]}）",
                     sys.version_info >= (3, 10), ''))
 
-    for m in ('openai', 'rich', 'yaml'):
+    # prompt_toolkit：输入框自绘库（长输入软换行/宽字符根治）；
+    # 缺失时 CLI 自动降级内置 input()，但长输入覆盖 bug 会复发
+    for m in ('openai', 'rich', 'yaml', 'prompt_toolkit'):
         results.append((f"核心依赖 {m}", importlib.util.find_spec(m) is not None, ''))
 
     for group, mods in {'memory': ['numpy', 'faiss', 'openpyxl'],

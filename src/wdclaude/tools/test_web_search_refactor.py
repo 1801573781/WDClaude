@@ -44,6 +44,8 @@ def cfg_factory(monkeypatch, tmp_path):
     monkeypatch.setattr(ws, "_search_cache_instance", None)
     monkeypatch.setattr(ws, "_fetch_cache_instance", None)
     monkeypatch.setattr(ws, "_rate_limiter_instance", None)
+    monkeypatch.setattr(ws, "_breaker_instance", None)
+    monkeypatch.setattr(ws, "_fetch_fail_cache", {}, raising=False)
     monkeypatch.setattr(ws, "_session_call_counts", {"web_search": 0, "web_fetch": 0})
     monkeypatch.setattr(ws, "_last_user_input", "")
     # 缓存目录隔离：所有测试统一指向临时目录
@@ -503,7 +505,7 @@ class TestFetchExecution:
                             lambda *a, **k: _mk_response(200, {"content": long_md}))
         out = ws.execute_web_fetch({"url": "https://e.com/long"})
         assert out["display"]["truncated"] is True
-        assert "因预算截断" in out["llm_text"]
+        assert "首尾保留注入" in out["llm_text"]
         assert out["display"]["char_count"] == 2000
 
     def test_403_security_policy(self, monkeypatch, patched_config):
@@ -760,3 +762,76 @@ class TestBackwardCompat:
         assert isinstance(out["llm_text"], str)
         assert isinstance(out["display"], dict)
         json.dumps(out, ensure_ascii=False)   # 可序列化（缓存/日志安全）
+
+
+# ======================== 首尾保留截断与失败熔断 ========================
+
+class TestTruncateMiddle:
+    def test_short_text_untouched(self):
+        text, truncated, omitted = ws._truncate_middle("短文本", 500)
+        assert text == "短文本" and truncated is False and omitted == 0
+
+    def test_keeps_head_and_tail(self):
+        text = "HEAD" + "m" * 3000 + "TAIL"
+        out, truncated, omitted = ws._truncate_middle(text, 500)
+        assert truncated is True
+        assert out.startswith("HEAD")
+        assert out.endswith("TAIL")          # 尾部数据表不被丢弃
+        assert omitted > 0
+        assert len(out) <= 500 + 130          # 预算 + 省略标记
+
+    def test_marker_mentions_omitted_count(self):
+        out, _, omitted = ws._truncate_middle("x" * 5000, 600)
+        assert f"省略 {omitted} 字符" in out
+
+    def test_token_budget_uses_chars_per_token(self):
+        # 预算 1000 token × 2.5 字符 ≈ 2500 字符，明显大于旧实现（×2 = 2000）
+        assert int(1000 * ws._CHARS_PER_TOKEN) == 2500
+
+
+class TestFetchFailureGuards:
+    def test_negative_cache_prevents_second_request(self, monkeypatch, patched_config):
+        calls = {"n": 0}
+
+        def _fail(*a, **k):
+            calls["n"] += 1
+            raise ws.requests.exceptions.Timeout("boom")
+
+        monkeypatch.setattr(ws.requests, "post", _fail)
+        patched_config["cfg"].max_retries = 0
+        out1 = ws.execute_web_fetch({"url": "https://slow.example.com/a"})
+        out2 = ws.execute_web_fetch({"url": "https://slow.example.com/a"})
+        assert calls["n"] == 1                       # 第二次走负面缓存，未再请求
+        assert out1["llm_text"].startswith("[ERROR]")
+        assert "近期已抓取失败" in out2["llm_text"]
+
+    def test_domain_breaker_opens_after_threshold(self, monkeypatch, patched_config):
+        calls = {"n": 0}
+
+        def _fail(*a, **k):
+            calls["n"] += 1
+            raise ws.requests.exceptions.Timeout("boom")
+
+        monkeypatch.setattr(ws.requests, "post", _fail)
+        patched_config["cfg"].max_retries = 0
+        patched_config["cfg"].domain_fail_threshold = 2
+        patched_config["cfg"].fetch_fail_ttl = 0     # 关掉负面缓存，单独验证熔断
+        ws.execute_web_fetch({"url": "https://bad.example.com/1"})
+        ws.execute_web_fetch({"url": "https://bad.example.com/2"})
+        out = ws.execute_web_fetch({"url": "https://bad.example.com/3"})
+        assert calls["n"] == 2                       # 第 3 个 URL 被熔断跳过
+        assert "域名熔断中" in out["llm_text"]
+
+    def test_breaker_reset_on_new_session(self, monkeypatch, patched_config):
+        ws._get_breaker(patched_config["cfg"]).record_fail("https://x.com/a")
+        ws.reset_session_counters()
+        assert ws._breaker_instance is None
+
+    def test_success_clears_domain_failure(self, monkeypatch, patched_config):
+        breaker = ws._get_breaker(patched_config["cfg"])
+        breaker.record_fail("https://e.com/a")
+        assert breaker._fails.get("e.com") == 1
+        monkeypatch.setattr(ws.requests, "post",
+                            lambda *a, **k: _mk_response(200, {"content": "# ok"}))
+        ws.execute_web_fetch({"url": "https://e.com/b"})
+        assert "e.com" not in breaker._fails
