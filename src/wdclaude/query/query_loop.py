@@ -1377,6 +1377,10 @@ class QueryLoop:
         tool_exec_info = []
         fv_seen = set()  # 本轮已执行的 file_view 键（path/limit/offset），用于单轮去重
         fv_dup_warned = 0  # 单轮内重复 file_view 的阻断提示计数（超过 3 个后静默跳过）
+        # 本轮是否有工具真正执行（未被前置防护阻断）。
+        # 用于 Tool-Done 同轮分离判定：只有工具真的跑过，才值得丢弃 done
+        # 让结果回灌；若全部被阻断，done 照常生效，避免任何潜在空转。
+        any_effective_tool = False
 
         # 执行普通工具
         if exec_tools:
@@ -1490,6 +1494,9 @@ class QueryLoop:
                                 "content": f"[ERROR] 工具 {t['llm_tool']} 执行失败: {e}"
                             }
 
+                if not blocked:
+                    any_effective_tool = True
+
                 self._print_tool_result(t["llm_tool"], result_msg.get("content", ""), t["params"])  # 打印：工具执行结果
                 self.session.log_tool_result(t["llm_tool"], result_msg)
 
@@ -1580,6 +1587,29 @@ class QueryLoop:
         # 处理 done
         if done_tools:
             msg = done_tools[0]["params"].get("message", "任务完成")
+
+            # ===== Tool-Done 同轮分离（强制拦截，非提示词约束）=====
+            # 现场：LLM 把 file_view/bash/create 与 done 写进同一轮回复。
+            # 若此处直接返回 QuitByDone，主循环立即 break，工具结果虽已 append
+            # 到 api_messages，LLM 却永远没有下一轮去读它——用户视角就是
+            # "读到一半/搜到一半突然停住"。提示词已多次强调仍会复发，故在
+            # 引擎层强制丢弃本轮的 done（与上方 has_ask_user 同一处置模式）。
+            # 丢弃后不额外注入提醒：工具结果本身就会驱动下一轮继续，
+            # 注入只会白烧 token 并打断 LLM 的自然推进。
+            if any_effective_tool:
+                self._print_info(
+                    "[协议纠正] 本轮同时包含工具与 done，已忽略 done，"
+                    "先返回工具结果继续推进（done 将在工具结果消化后再判定）"
+                )
+                self.session.log_dict_info({
+                    "role": "system",
+                    "content": (
+                        f"[协议纠正] 同一轮回复同时包含工具调用与 done，已强制忽略 done"
+                        f"（done 内容: {msg[:80]}），待工具结果回灌后由 LLM 重新决策"
+                    )
+                })
+                return ChatOrNot.Continue, tool_exec_info
+
             self._print_info(msg)
             self.session.log_dict_info({"role": "assistant", "content": msg})
 

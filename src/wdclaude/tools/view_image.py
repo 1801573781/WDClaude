@@ -5,7 +5,10 @@ XML 协议（与现有工具协议一致）：
     <view_image path="D:/proj/screenshot.png" region="0.62,0.71,0.85,0.80" focus="逐字OCR报错堆栈"/>
 
 参数：
-- path（必填）：原图绝对路径
+- path（必填）：本地图像绝对路径，或 http(s) 图像 URL。URL 在纯全图
+  理解时透传给视觉提供方（服务端自行下载，零磁盘）；需要 region 特写、
+  native 注入或提供方未声明支持外部链接时，先下载落地到
+  .wdclaude/media/download/ 再走既有像素管线
 - region（可选）：归一化坐标 x0,y0,x1,y1（0-1 闭区间）或语义描述
   （"红色按钮周围200px"，经视觉旁路定位换算）；缺省 = 全图重看
 - focus（可选）：定向任务提示，映射到 extract_focus prompt
@@ -47,8 +50,10 @@ from wdclaude.vision.image_processor import (
     preprocess_image,
     resolve_semantic_region,
 )
+from wdclaude.paths import paths
 from wdclaude.vision.lifecycle import build_native_tool_result
 from wdclaude.vision.media_types import MediaKind, MediaRegistry
+from wdclaude.vision.remote_fetch import RemoteFetchError, is_remote_url, materialize
 from wdclaude.vision.vision_client import VisionClient, VisionFatalError
 from wdclaude.vision.vision_extractor import VisionExtractor
 
@@ -116,11 +121,9 @@ class ViewImageTool:
         """
         path = str(params.get("path", "") or "").strip()
         if not path:
-            return self._text_result("[view_image] 缺少必填参数 path（原图绝对路径）")
-        normalized = path.replace("\\", "/")
-        src = Path(normalized)
-        if not src.is_file():
-            return self._text_result(f"[view_image] 图像文件不存在: {normalized}")
+            return self._text_result(
+                "[view_image] 缺少必填参数 path（本地绝对路径或 http(s) 图像 URL）"
+            )
 
         # 熔断检查（7.4）：次数或 token 预算任一达上限即拒绝
         if self.zoom_count >= self.max_zoom or self.token_used >= self.token_budget:
@@ -128,6 +131,29 @@ class ViewImageTool:
 
         region_raw = str(params.get("region", "") or "").strip()
         focus = str(params.get("focus", "") or "").strip()
+
+        # 远程 URL 分流：
+        # - 纯全图理解 -> 透传给提供方（服务端下载，请求体极小、零磁盘）
+        # - region 特写 / native 注入 / 提供方未声明支持 -> 先落地再走像素管线
+        supports_url = bool(self.extractor.client.route.supports_external_url)
+        source_is_remote = is_remote_url(path)
+        need_local = source_is_remote and (
+            bool(region_raw) or self.mode == "native" or not supports_url
+        )
+
+        if source_is_remote and not need_local:
+            return self._run_url_passthrough(path, focus)
+
+        if need_local:
+            try:
+                src = materialize(path, paths.media_download_dir)
+            except RemoteFetchError as exc:
+                return self._text_result(f"[view_image] {exc}")
+        else:
+            src = Path(path.replace("\\", "/"))
+            if not src.is_file():
+                return self._text_result(f"[view_image] 图像文件不存在: {src}")
+        normalized = str(src).replace("\\", "/")
 
         # region 解析（6.2）：归一化坐标优先，语义描述经视觉旁路换算
         box: RegionBox | None = None
@@ -182,6 +208,31 @@ class ViewImageTool:
         if self.mode == "native":
             return self._run_native(normalized, target_path, crop_tag, box, locator_path, focus)
         return self._run_cascade(normalized, target_path, crop_tag, box, locator_path, focus)
+
+    # ------------------------------------------------------------------
+    # URL 透传（纯全图理解：服务端下载，不落本地磁盘）
+    # ------------------------------------------------------------------
+    def _run_url_passthrough(self, url: str, focus: str) -> dict:
+        """远程 URL 直接交给视觉模型，规避 base64 膨胀与磁盘占用。"""
+        if url == self._last_path:
+            self._consecutive_same_path += 1
+        else:
+            self._consecutive_same_path = 1
+            self._last_path = url
+        self.zoom_count += 1
+        try:
+            extracted = self.extractor.extract_focus_source(
+                url, focus or "无（全区域结构化描述）"
+            )
+        except VisionFatalError as exc:
+            raise VisionFatalError(f"{exc}；建议检查网络连通性或稍后重试") from exc
+        parts = [
+            f"[TOOL_RESULT] 全图提取 {url}",
+            extracted.strip(),
+            "[说明] 本次为 URL 透传（由视觉模型自行下载），未在本地落盘；"
+            "如需 region 特写将自动下载到 .wdclaude/media/download/ 后处理。",
+        ]
+        return {"role": "user", "content": "\n".join(parts)}
 
     # ------------------------------------------------------------------
     # 语义 region 定位（6.2：经视觉旁路换算归一化坐标）

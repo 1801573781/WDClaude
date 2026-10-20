@@ -21,11 +21,17 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from wdclaude.paths import paths
 from wdclaude.vision.image_processor import ImageDecodeError
 from wdclaude.vision.media_types import (
     MediaAsset,
     MediaKind,
     MediaRegistry,
+)
+from wdclaude.vision.remote_fetch import (
+    RemoteFetchError,
+    is_remote_url,
+    materialize,
 )
 from wdclaude.vision.vision_client import VisionClient, VisionFatalError
 
@@ -201,9 +207,11 @@ class VisionExtractor:
             prompt = prompt + "\n\n" + _load_prompt("intent_profile.txt")
 
         if len(assets) == 1:
-            messages = VisionClient.image_message(prompt, assets[0].path, detail=self.detail)
+            messages = self.client.build_image_message(
+                prompt, assets[0].path, detail=self.detail
+            )
         else:
-            messages = VisionClient.multi_image_message(
+            messages = self.client.build_multi_image_message(
                 prompt, [a.path for a in assets], detail=self.detail
             )
         raw = self.client.chat(messages)
@@ -217,10 +225,18 @@ class VisionExtractor:
 
         返回结构化文本（分区格式），由 view_image 包装为工具结果。
         """
+        return self.extract_focus_source(Path(cropped_path), focus)
+
+    def extract_focus_source(self, source: Path | str, focus: str) -> str:
+        """定点提取，source 可为本地图像路径或 http(s) 图像 URL。
+
+        URL 是否可透传由 vision_client 依据 main_mlm.provider 配置的能力
+        判定（未声明支持则抛 VisionFatalError，由调用方降级为本地落地）。
+        """
         prompt = _load_prompt("extract_focus.txt")
-        messages = VisionClient.image_message(
+        messages = self.client.build_image_message(
             prompt + f"\n\nfocus 定向任务：{focus or '无（全区域结构化描述）'}",
-            Path(cropped_path),
+            source,
             detail=self.detail,
         )
         return self.client.chat(messages)
@@ -368,7 +384,15 @@ def run_vision_pipeline(
     failed: list[str] = []
     last_err: Exception | None = None
     for p in paths:
-        ext = Path(p).suffix.lower()
+        # 远程图像 URL：全景提取需要本地像素（后缀判定、解码、尺寸统计），
+        # 先落地到 media/download 缓存再走既有预处理链路
+        local_path = p
+        if is_remote_url(p):
+            try:
+                local_path = str(materialize(p, paths.media_download_dir))
+            except RemoteFetchError as exc:
+                raise VisionFatalError(str(exc)) from exc
+        ext = Path(local_path).suffix.lower()
         kind = registry.resolve_kind(ext)
         if kind is None:
             raise VisionFatalError(
@@ -382,7 +406,11 @@ def run_vision_pipeline(
                 f"media.handlers 中开启（引用: {p}）"
             )
         try:
-            asset = handler.resolve(p)
+            asset = handler.resolve(local_path)
+            # 远程来源：保留原 URL 作为锚点，便于 view_image 重看与日志追溯
+            if is_remote_url(p):
+                asset.meta["original_path"] = p
+                asset.meta["remote_url"] = p
             asset = handler.preprocess(asset)
             assets.append(asset)
         except ImageDecodeError as exc:

@@ -140,6 +140,21 @@ class PathResolver:
         return self.data_root / 'cache'
 
     @property
+    def media_root(self) -> Path:
+        """B/.wdclaude/media（多模态素材根：特写产物与远程下载缓存）。"""
+        return self.data_root / 'media'
+
+    @property
+    def media_download_dir(self) -> Path:
+        """B/.wdclaude/media/download（远程图像落地缓存）。"""
+        return self.media_root / 'download'
+
+    @property
+    def media_view_dir(self) -> Path:
+        """B/.wdclaude/media/view（特写裁剪产物）。"""
+        return self.media_root / 'view'
+
+    @property
     def commands_dir(self) -> Path:
         """斜杠命令目录 B/.wdclaude/commands（唯一锚点）。"""
         return self.data_root / 'commands'
@@ -185,6 +200,9 @@ class PathResolver:
             'stats_dir': self.stats_dir,
             'backups_dir': self.backups_dir,
             'cache_dir': self.cache_dir,
+            'media_root': self.media_root,
+            'media_download_dir': self.media_download_dir,
+            'media_view_dir': self.media_view_dir,
             'commands_dir': self.commands_dir,
             'init_root': self.init_root,
             'home_model_key': self.home_model_key,
@@ -215,6 +233,9 @@ class PathResolver:
             self.stats_dir,
             self.backups_dir,
             self.cache_dir,
+            self.media_root,
+            self.media_download_dir,
+            self.media_view_dir,
             self.data_root / 'context',
             self.data_root / 'data',
             self.data_root / 'docs',

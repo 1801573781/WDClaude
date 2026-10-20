@@ -100,8 +100,19 @@ main_model:
 # ===== 多模态模型选择（provider 填写上方任一节名）=====
 # 用途：视觉提取（级联方案的 B 生产者）、view_image 执行、native 多模态模式下的主循环 LLM
 # 两级路由：main_mlm.provider -> 服务商节（api_key / base_url / model_name / extra_body）
+#
+# 以下两个字段为【可选覆盖】，不填则按 provider/model_name 名称自动推断：
+#   - supports_external_url：是否允许把 http(s) 图像 URL 直接交给服务端下载。
+#       DeepSeek / GLM 系默认 true；未识别的提供方默认 false（保守），
+#       此时 URL 会先下载到 .wdclaude/media/download/ 再处理。
+#   - base64_mode：本地图片的编码形式。"data_url" 为 data:image/...;base64,...；
+#       "raw" 为裸 base64。部分 GLM 网关只接受裸 base64，GLM 系默认 raw。
+#   需要 region 特写 / 裁剪 / 画框定位时，无论是否支持 URL 都会先下载落地，
+#   因为像素级操作必须有本地文件。
 main_mlm:
   provider: "GLM-main-mlm"
+  # supports_external_url: true
+  # base64_mode: "raw"
 
 # ===== 记忆系统模型参数 =====
 memory:

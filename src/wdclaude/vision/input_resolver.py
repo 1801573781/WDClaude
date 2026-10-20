@@ -30,11 +30,21 @@ _AT_QUOTED = re.compile(r'@\s*"([^"\n]+)"')
 # 路径字符集：排除空白与常见中英文标点界定符，允许 CJK 与普通文件名字符
 _PATH_CHARS = r'[^\s，。；、！？）)】》」』"\'<>|*?]'
 
+# @ 后跟 http(s) URL（显式引用远程图像）
+_AT_URL = re.compile(r'@\s*(https?://[^\s<>"\']+)', re.IGNORECASE)
+
 # @ 后跟裸 Windows 绝对路径（盘符开头，仅支持绝对路径，3.6）
 _AT_BARE = re.compile(r'@([A-Za-z]:[\\/]' + _PATH_CHARS + r'*)')
 
-# 裸 Windows 绝对路径候选（A 中原样保留，仅记录候选）
-_ABS_WIN = re.compile(r'([A-Za-z]:[\\/]' + _PATH_CHARS + r'*)')
+# 裸 Windows 绝对路径候选（A 中原样保留，仅记录候选）。
+# 负向后顾避免把 "https://" 中的 "s:/" 误判为盘符路径。
+_ABS_WIN = re.compile(
+    r'(?<![A-Za-z0-9_/\\\-])([A-Za-z]:[\\/]' + _PATH_CHARS + r'*)'
+)
+
+# http(s) 图像 URL 候选（A 中原样保留，仅记录候选；长度上限由
+# remote_fetch 在真正下载/透传时校验）
+_URL_CANDIDATE = re.compile(r'(https?://[^\s<>"\']+)', re.IGNORECASE)
 
 # 默认文本/代码扩展名（裸文件名候选，"按 521.txt 修改"类）；
 # 媒体扩展名由调用方从 registry.media_extensions 动态传入合并（D10）
@@ -90,8 +100,13 @@ class ResolvedInput:
 # 工具函数
 # ----------------------------------------------------------------------
 def normalize_path(raw: str) -> str:
-    """路径规范化：反斜杠转正斜杠，去首尾空白与包裹引号。"""
+    """路径规范化：反斜杠转正斜杠，去首尾空白与包裹引号。
+
+    URL 保持原样（仅去首尾空白），不参与反斜杠替换。
+    """
     s = (raw or "").strip().strip('"').strip("'").strip()
+    if re.match(r'^https?://', s, re.IGNORECASE):
+        return s
     return s.replace("\\", "/")
 
 
@@ -143,11 +158,17 @@ def resolve_input(
         seen.add(p)
         references.append(FileRef(path=p, explicit=explicit, start=start, end=end))
 
-    # 1) @ 显式引用：先取引号形式（可含空格），再取裸形式（跳过重叠区间）
+    # 1) @ 显式引用：引号形式（可含空格）→ URL 形式 → 裸盘符形式
     quoted_spans: list[tuple[int, int]] = []
     at_matches: list[tuple[int, int, str]] = []  # (start, end, path)
     for m in _AT_QUOTED.finditer(raw):
         span = (m.start(), m.end())
+        quoted_spans.append(span)
+        at_matches.append((m.start(), m.end(), m.group(1)))
+    for m in _AT_URL.finditer(raw):
+        span = (m.start(), m.end())
+        if any(_spans_overlap(span, q) for q in quoted_spans):
+            continue
         quoted_spans.append(span)
         at_matches.append((m.start(), m.end(), m.group(1)))
     for m in _AT_BARE.finditer(raw):
@@ -170,20 +191,35 @@ def resolve_input(
     for start, end, path in at_matches:
         _add(_strip_trailing_punct(path), True, start, end)
 
-    # 4) 裸绝对路径候选（clean_text 中扫描；A 中原样保留，不剥离）
+    # 4) http(s) URL 候选（优先于盘符路径扫描，避免 "s:/" 被误判）。
+    #    图像 URL 可透传给视觉提供方；此处仅登记，是否可访问、是否真为
+    #    图像由后续环节判定，L0 不做拦截
+    url_spans: list[tuple[int, int]] = []
+    for m in _URL_CANDIDATE.finditer(clean_text):
+        span = (m.start(), m.end())
+        if any(_spans_overlap(span, u) for u in url_spans):
+            continue
+        url_spans.append(span)
+        _add(_strip_trailing_punct(m.group(1)), False, span[0], span[1])
+
+    # 5) 裸绝对路径候选（A 中原样保留，不剥离；跳过 URL 内部片段）
     bare_spans: list[tuple[int, int]] = []
     for m in _ABS_WIN.finditer(clean_text):
         span = (m.start(), m.end())
+        if any(_spans_overlap(span, u) for u in url_spans):
+            continue
         if any(_spans_overlap(span, b) for b in bare_spans):
             continue
         bare_spans.append(span)
         _add(_strip_trailing_punct(m.group(1)), False, span[0], span[1])
 
-    # 5) 已知扩展名文件名候选（跳过与裸绝对路径重叠的尾段匹配）
+    # 6) 已知扩展名文件名候选（跳过与裸绝对路径 / URL 重叠的尾段匹配）
     fname_re = _filename_pattern(media_extensions)
     for m in fname_re.finditer(clean_text):
         span = (m.start(), m.end())
         if any(_spans_overlap(span, b) for b in bare_spans):
+            continue
+        if any(_spans_overlap(span, u) for u in url_spans):
             continue
         # 前一字符为路径分隔符说明是更长路径的尾段（未被 4 覆盖的残段），
         # 仅当该残段本身形如绝对路径时才保留；此处统一放行为候选
